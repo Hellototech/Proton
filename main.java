@@ -32,11 +32,10 @@ import java.util.concurrent.TimeUnit;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
-import javax.tools.JavaCompiler;
-import javax.tools.ToolProvider;
-
 import javax.imageio.ImageIO;
 import javax.sound.sampled.*;
+import javax.tools.JavaCompiler;
+import javax.tools.ToolProvider;
 
 public class main {
 
@@ -125,8 +124,8 @@ public class main {
 
             List<String> cmd = new ArrayList<>();
             cmd.add(javaBin);
-            if (codeRoot != null && codeRoot.isDirectory()
-                    && new File(codeRoot, "main.class").isFile()) {
+            if (codeRoot != null && codeRoot.isDirectory() && new File(codeRoot, "main.class").isFile()) {
+                // Compiled in place by the updater: relaunch the fresh classes.
                 cmd.add("-cp");
                 cmd.add(codeRoot.getAbsolutePath());
                 cmd.add("main");
@@ -135,6 +134,8 @@ public class main {
                 cmd.add(codeRoot.getAbsolutePath());
             } else if (source.isFile()) {
                 // Started with the single-file source launcher: relaunch the source.
+                cmd.add("-cp");
+                cmd.add(cp == null || cp.isEmpty() ? "." : cp);
                 cmd.add(source.getAbsolutePath());
             } else {
                 cmd.add("-cp");
@@ -142,10 +143,11 @@ public class main {
                 cmd.add("main");
             }
             new ProcessBuilder(cmd).start();
-            System.exit(0);
         } catch (Throwable ignored) {
             // Keep the current window alive if the relaunch could not be started.
+            return;
         }
+        System.exit(0);
     }
 
     /** Soft 320 ms opacity fade-in so the splash hands off cleanly to the UI. */
@@ -2364,8 +2366,8 @@ final class Prefs {
 }
 
 /* =============================================================== */
-/*  GITHUB UPDATER -- checks Hellototech/Proton and installs new    */
-/*  commits into this folder, then recompiles main.java.            */
+/*  GITHUB UPDATER -- checks Hellototech/Proton for new commits,    */
+/*  installs the newest main.java and recompiles it.                */
 /* =============================================================== */
 
 final class UpdateKit {
@@ -2380,7 +2382,7 @@ final class UpdateKit {
                      INSTALLING = 4, UPDATED = 5, FAILED = 6;
 
     static volatile int state = IDLE;
-    static volatile String message = "Checks your GitHub repo for new commits.";
+    static volatile String message = "Check GitHub for a newer version of PROTON.";
     static volatile boolean auto = Prefs.getBool("update.auto", true);
     private static volatile String latestSha = "";
     private static volatile Runnable repaintHook;
@@ -2406,6 +2408,10 @@ final class UpdateKit {
         return Theme.TEXT3;
     }
 
+    static boolean isBusy() {
+        return state == CHECKING || state == INSTALLING;
+    }
+
     /** Slider in Settings: on by default, remembered across launches. */
     static void setAuto(boolean on) {
         auto = on;
@@ -2416,7 +2422,8 @@ final class UpdateKit {
 
     /** The Update button: install a known update, otherwise check GitHub. */
     static void pressUpdate() {
-        if (state == CHECKING || state == INSTALLING) return;
+        if (isBusy()) return;
+        if (state == UPDATED) return;                 // installed, waiting for restart
         if (state == AVAILABLE && !latestSha.isEmpty()) startInstallAsync(true);
         else checkAsync(true);
     }
@@ -2440,7 +2447,7 @@ final class UpdateKit {
         Commit c = fetchLatest();
         String known = Prefs.getString("update.commit", "");
         if (known.isEmpty()) {
-            // First check: remember the commit we are starting from.
+            // First ever check: this build is the starting point.
             Prefs.setString("update.commit", c.sha);
             latestSha = c.sha;
             set(UP_TO_DATE, "Up to date.");
@@ -2452,11 +2459,8 @@ final class UpdateKit {
             return;
         }
         latestSha = c.sha;
-        if (manual || auto) {
-            installBlocking(manual);
-        } else {
-            set(AVAILABLE, "Update available \u00B7 " + shortSha(c.sha));
-        }
+        if (manual || auto) installBlocking(manual);
+        else set(AVAILABLE, "Update available \u00B7 " + shortSha(c.sha));
     }
 
     private static void startInstallAsync(final boolean restartWhenDone) {
@@ -2481,28 +2485,25 @@ final class UpdateKit {
         try {
             set(INSTALLING, "Downloading update\u2026");
             File src = fetchRemoteSource(tmp);
-
-            set(INSTALLING, "Checking update\u2026");
-            File checkDir = new File(tmp, "check");
-            compile(src, checkDir);                     // never install source that doesn't build
-
             File appDir = appDir();
             File target = new File(appDir, "main.java");
             File backup = new File(appDir, "main.java.bak");
-            if (target.isFile()) copyFile(target, backup);
-            copyFile(src, target);
+
+            // Compile in an isolated folder first: never touch the app unless the
+            // downloaded source builds cleanly.
+            set(INSTALLING, "Checking update\u2026");
+            File buildDir = new File(tmp, "build");
+            compile(src, buildDir);
 
             set(INSTALLING, "Installing update\u2026");
-            File buildDir = new File(tmp, "build");
+            if (target.isFile()) copyFile(target, backup);
             try {
-                // Build from the new source in an isolated folder, then copy the
-                // compiled classes over, so a bad build can never half-replace the app.
-                compile(target, buildDir);
+                copyFile(src, target);
+                copyTree(buildDir, appDir);
             } catch (IOException ce) {
                 if (backup.isFile()) copyFile(backup, target);
                 throw ce;
             }
-            copyTree(buildDir, appDir);
             Prefs.setString("update.commit", sha);
             String label = shortSha(sha);
 
@@ -2543,6 +2544,8 @@ final class UpdateKit {
             c.setReadTimeout(15000);
             c.setInstanceFollowRedirects(true);
             int code = c.getResponseCode();
+            if (code == 403 || code == 429)
+                throw new IOException("GitHub is busy \u00B7 try again in a minute.");
             if (code >= 400) throw new IOException("GitHub is unreachable right now.");
             return readAll(c.getInputStream());
         } catch (IllegalArgumentException ex) {
@@ -2656,14 +2659,17 @@ final class UpdateKit {
         return "Update failed \u00B7 " + pick;
     }
 
+    /** Folder that holds the running main.java (the project folder when launched from source). */
     private static File appDir() {
+        File cwd = new File(System.getProperty("user.dir", "."));
+        if (new File(cwd, "main.java").isFile()) return cwd;
         try {
             File f = new File(UpdateKit.class.getProtectionDomain()
                     .getCodeSource().getLocation().toURI());
             if (f.isDirectory()) return f;
             if (f.isFile() && f.getParentFile() != null) return f.getParentFile();
         } catch (Throwable ignored) {}
-        return new File(System.getProperty("user.dir", "."));
+        return cwd;
     }
 
     private static void copyFile(File from, File to) throws IOException {
@@ -3283,7 +3289,7 @@ class SettingsPanel extends JComponent {
                 if (closeR.contains(p)) { SettingsPanel.this.onClose.run(); return; }
                 if (keysR.contains(p)) { SettingsPanel.this.onChangeKeys.run(); return; }
                 if (updateR.contains(p)) { UpdateKit.pressUpdate(); repaint(); return; }
-                if (autoR.contains(p) || (p.y > 412 && p.y < 448)) {
+                if (autoR.contains(p) || (p.y > 428 && p.y < 500)) {
                     UpdateKit.setAuto(!UpdateKit.auto);
                     repaint();
                     return;
@@ -3308,14 +3314,30 @@ class SettingsPanel extends JComponent {
     void setWake(boolean on) { wakeOn = on; repaint(); }
     void setNoise(int lvl) { noiseLevel = lvl; repaint(); }
 
-    private static String ellipsize(Graphics2D g2, String text, int maxWidth) {
-        if (text == null) return "";
+    /** Wraps a status message into at most maxLines lines that fit maxWidth. */
+    private static String[] wrap(Graphics2D g2, String text, int maxWidth, int maxLines) {
+        List<String> lines = new ArrayList<>();
+        String rest = text == null ? "" : text.trim();
+        if (rest.isEmpty()) return new String[]{""};
         FontMetrics fm = g2.getFontMetrics();
-        if (fm.stringWidth(text) <= maxWidth) return text;
-        String dots = "\u2026";
-        int end = text.length();
-        while (end > 0 && fm.stringWidth(text.substring(0, end) + dots) > maxWidth) end--;
-        return text.substring(0, end) + dots;
+        while (!rest.isEmpty() && lines.size() < maxLines) {
+            if (fm.stringWidth(rest) <= maxWidth) { lines.add(rest); rest = ""; break; }
+            int cut = rest.length();
+            while (cut > 0 && fm.stringWidth(rest.substring(0, cut) + "\u2026") > maxWidth) cut--;
+            int sp = rest.lastIndexOf(' ', Math.max(0, cut));
+            if (sp > 0) cut = sp;
+            if (cut <= 0) break;
+            lines.add(rest.substring(0, cut).trim());
+            rest = rest.substring(cut).trim();
+        }
+        if (!rest.isEmpty() && !lines.isEmpty()) {
+            int last = lines.size() - 1;
+            String s = lines.get(last);
+            while (!s.isEmpty() && fm.stringWidth(s + "\u2026") > maxWidth)
+                s = s.substring(0, s.length() - 1);
+            lines.set(last, s.trim() + "\u2026");
+        }
+        return lines.toArray(new String[0]);
     }
 
     protected void paintComponent(Graphics g) {
@@ -3434,19 +3456,18 @@ class SettingsPanel extends JComponent {
 
         g2.setFont(Fnt.get(Font.BOLD, 12.5f));
         g2.setColor(Theme.TEXT);
-        g2.drawString("Updates", 20, 332);
+        g2.drawString("Updates", 20, 330);
 
         g2.setFont(Fnt.get(Font.PLAIN, 9.5f));
         g2.setColor(Theme.TEXT3);
         String repo = "github.com/" + UpdateKit.OWNER + "/" + UpdateKit.REPO;
         FontMetrics rf = g2.getFontMetrics();
-        g2.drawString(repo, w - 20 - rf.stringWidth(repo), 331);
+        g2.drawString(repo, w - 20 - rf.stringWidth(repo), 329);
 
-        updateR.setBounds(20, 344, 132, 32);
-        boolean busy = UpdateKit.state == UpdateKit.CHECKING
-                || UpdateKit.state == UpdateKit.INSTALLING;
+        updateR.setBounds(20, 342, 140, 34);
+        boolean busy = UpdateKit.isBusy();
         RoundRectangle2D updateBtn = new RoundRectangle2D.Float(
-                updateR.x, updateR.y, updateR.width, updateR.height, 16, 16);
+                updateR.x, updateR.y, updateR.width, updateR.height, 17, 17);
         if (busy) {
             g2.setColor(new Color(0x3A3550));
             g2.fill(updateBtn);
@@ -3471,17 +3492,22 @@ class SettingsPanel extends JComponent {
 
         g2.setFont(Fnt.get(Font.PLAIN, 10.5f));
         g2.setColor(UpdateKit.statusColor());
-        g2.drawString(ellipsize(g2, UpdateKit.message, w - 40), 20, 398);
+        String[] lines = wrap(g2, UpdateKit.message, w - 40, 2);
+        int ly = 398;
+        for (String line : lines) {
+            g2.drawString(line, 20, ly);
+            ly += 15;
+        }
 
         g2.setColor(new Color(255, 255, 255, 16));
-        g2.drawLine(16, 412, w - 16, 412);
+        g2.drawLine(16, 428, w - 16, 428);
 
         g2.setFont(Fnt.get(Font.BOLD, 12.5f));
         g2.setColor(Theme.TEXT);
-        g2.drawString("Auto update", 20, 436);
+        g2.drawString("Auto update", 20, 452);
 
         int atw = 46, ath = 26;
-        int atx = w - 20 - atw, aty = 418;
+        int atx = w - 20 - atw, aty = 434;
         autoR.setBounds(atx, aty, atw, ath);
         RoundRectangle2D autoTrack = new RoundRectangle2D.Float(atx, aty, atw, ath, ath, ath);
         if (UpdateKit.auto) {
@@ -3503,9 +3529,8 @@ class SettingsPanel extends JComponent {
 
         g2.setFont(Fnt.get(Font.PLAIN, 10.5f));
         g2.setColor(Theme.TEXT3);
-        g2.drawString("Checks GitHub every 10 minutes and installs new", 20, 458);
-        g2.drawString("commits automatically. On by default.", 20, 472);
-
+        g2.drawString("Checks GitHub every 10 minutes and installs new", 20, 476);
+        g2.drawString("commits automatically. On by default.", 20, 490);
         g2.dispose();
     }
 }
@@ -4234,7 +4259,6 @@ class TopBar extends JPanel {
         g2.setFont(Fnt.get(Font.PLAIN, 12.5f));
         g2.setColor(stCol);
         g2.drawString(st, tx, cy + fm.getAscent() / 2 - 1);
-
         g2.dispose();
     }
 }

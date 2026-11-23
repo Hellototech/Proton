@@ -112,6 +112,27 @@ public class main {
 
     static void restartApp() {
         try {
+            // 1) Packaged Hermes-style EXE: relaunch the native launcher directly (no console window)
+            if ("true".equalsIgnoreCase(System.getProperty("proton.packaged"))) {
+                String jpkgExe = System.getProperty("jpackage.app-path", "");
+                if (!jpkgExe.isEmpty() && new File(jpkgExe).isFile()) {
+                    new ProcessBuilder(jpkgExe).start();
+                    System.exit(0);
+                    return;
+                }
+                String appDir = System.getProperty("proton.appdir", "");
+                String exeName = System.getProperty("proton.exe", "");
+                if (!appDir.isEmpty() && !exeName.isEmpty()) {
+                    File exe = new File(new File(appDir).getParentFile(), exeName);
+                    if (exe.isFile()) {
+                        new ProcessBuilder(exe.getAbsolutePath()).start();
+                        System.exit(0);
+                        return;
+                    }
+                }
+            }
+
+            // 2) Running from source / dev mode (unchanged)
             String javaBin = System.getProperty("java.home") + File.separator
                     + "bin" + File.separator + "java";
             String cp = System.getProperty("java.class.path");
@@ -125,7 +146,6 @@ public class main {
             List<String> cmd = new ArrayList<>();
             cmd.add(javaBin);
             if (codeRoot != null && codeRoot.isDirectory() && new File(codeRoot, "main.class").isFile()) {
-                // Compiled in place by the updater: relaunch the fresh classes.
                 cmd.add("-cp");
                 cmd.add(codeRoot.getAbsolutePath());
                 cmd.add("main");
@@ -133,7 +153,6 @@ public class main {
                 cmd.add("-jar");
                 cmd.add(codeRoot.getAbsolutePath());
             } else if (source.isFile()) {
-                // Started with the single-file source launcher: relaunch the source.
                 cmd.add("-cp");
                 cmd.add(cp == null || cp.isEmpty() ? "." : cp);
                 cmd.add(source.getAbsolutePath());
@@ -2486,6 +2505,7 @@ final class UpdateKit {
             set(INSTALLING, "Downloading update\u2026");
             File src = fetchRemoteSource(tmp);
             File appDir = appDir();
+            File classesTarget = classesDir(appDir);
             File target = new File(appDir, "main.java");
             File backup = new File(appDir, "main.java.bak");
 
@@ -2499,7 +2519,12 @@ final class UpdateKit {
             if (target.isFile()) copyFile(target, backup);
             try {
                 copyFile(src, target);
-                copyTree(buildDir, appDir);
+                // Clear old .class files in app\classes\ when packaged so removed inner classes don't linger
+                if (isPackaged() && classesTarget.isDirectory()) {
+                    File[] old = classesTarget.listFiles((d, n) -> n.endsWith(".class"));
+                    if (old != null) for (File f : old) f.delete();
+                }
+                copyTree(buildDir, classesTarget);
             } catch (IOException ce) {
                 if (backup.isFile()) copyFile(backup, target);
                 throw ce;
@@ -2659,17 +2684,42 @@ final class UpdateKit {
         return "Update failed \u00B7 " + pick;
     }
 
-    /** Folder that holds the running main.java (the project folder when launched from source). */
+        private static boolean isPackaged() {
+        return "true".equalsIgnoreCase(System.getProperty("proton.packaged"));
+        }
+
+    /** Folder that holds the running main.java (app\ when packaged, project folder from source). */
     private static File appDir() {
+        String prop = System.getProperty("proton.appdir", "");
+        if (!prop.isEmpty()) {
+            File d = new File(prop);
+            if (d.isDirectory()) return d;
+        }
         File cwd = new File(System.getProperty("user.dir", "."));
         if (new File(cwd, "main.java").isFile()) return cwd;
         try {
             File f = new File(UpdateKit.class.getProtectionDomain()
                     .getCodeSource().getLocation().toURI());
-            if (f.isDirectory()) return f;
+            if (f.isDirectory()) {
+                if ("classes".equals(f.getName()) && f.getParentFile() != null
+                        && new File(f.getParentFile(), "main.java").isFile()) {
+                    return f.getParentFile();
+                }
+                return f;
+            }
             if (f.isFile() && f.getParentFile() != null) return f.getParentFile();
         } catch (Throwable ignored) {}
         return cwd;
+    }
+
+    /** Where compiled .class files live: app\classes\ when packaged, appDir\ from source. */
+    private static File classesDir(File appDir) {
+        if (isPackaged()) {
+            File cls = new File(appDir, "classes");
+            if (!cls.isDirectory()) cls.mkdirs();
+            return cls;
+        }
+        return appDir;
     }
 
     private static void copyFile(File from, File to) throws IOException {

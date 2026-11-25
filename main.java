@@ -3757,6 +3757,7 @@ final class WarmWinTts {
             + "        Console.InputEncoding = Encoding.UTF8;\n"
             + "        Console.OutputEncoding = Encoding.UTF8;\n"
             + "        using (var synth = new SpeechSynthesizer()) {\n"
+            + "            try { synth.SelectVoiceByHints(VoiceGender.Male, VoiceAge.Adult); } catch {}\n"
             + "            synth.Volume = 100;\n"
             + "            synth.Rate = 1;\n"
             + "            var stateLock = new object();\n"
@@ -8247,8 +8248,15 @@ class Brain {
     static final String OPENROUTER_BASE = "https://openrouter.ai/api/v1";
     static final String OR_MODEL        = "nvidia/nemotron-3.5-super-vl:free";
     static final String OR_TTS_MODEL    = "fish-audio/s2.1-pro-free:free";
+    static final String DEFAULT_OPENROUTER_VOICE = "536d3a5e000945adb7038665781a4aca";
+    static final String DEFAULT_GEMINI_VOICE     = "Puck";
     static final String OR_REFERER      = "https://tryprotonai.pages.dev";
     static final String OR_TITLE        = "PROTON AI";
+
+    static String openrouterVoice() {
+        String v = Prefs.getString("openrouterVoice", "").trim();
+        return v.isEmpty() ? DEFAULT_OPENROUTER_VOICE : v;
+    }
 
     static final class Target {
         final boolean google;
@@ -13278,17 +13286,36 @@ class Brain {
     }
 
     void produceOpenRouterTtsStream(String text, TtsStream st) throws Exception {
-        String json = "{\"model\":" + js(OR_TTS_MODEL) + ",\"input\":" + js(text)
-                    + ",\"response_format\":\"pcm\"}";
-        HttpURLConnection c = orConn("/audio/speech", 60000);
-        st.conn = c;
-        c.setRequestMethod("POST");
-        c.setDoOutput(true);
-        c.setRequestProperty("Content-Type", "application/json");
-        try (OutputStream o = c.getOutputStream()) {
-            o.write(json.getBytes(StandardCharsets.UTF_8));
+        String voice = openrouterVoice();
+        String withInst = "{\"model\":" + js(OR_TTS_MODEL)
+                        + ",\"voice\":" + js(voice)
+                        + ",\"instructions\":" + js("Clear, calm, natural desktop assistant.")
+                        + ",\"input\":" + js(text)
+                        + ",\"response_format\":\"pcm\"}";
+        String plain = "{\"model\":" + js(OR_TTS_MODEL)
+                     + ",\"voice\":" + js(voice)
+                     + ",\"input\":" + js(text)
+                     + ",\"response_format\":\"pcm\"}";
+        HttpURLConnection c = null;
+        int code = 0;
+        String payload = withInst;
+        for (int attempt = 0; attempt < 2; attempt++) {
+            c = orConn("/audio/speech", 60000);
+            st.conn = c;
+            c.setRequestMethod("POST");
+            c.setDoOutput(true);
+            c.setRequestProperty("Content-Type", "application/json");
+            try (OutputStream o = c.getOutputStream()) {
+                o.write(payload.getBytes(StandardCharsets.UTF_8));
+            }
+            code = c.getResponseCode();
+            if (code == 400 && attempt == 0) {
+                try { readStr(c.getErrorStream()); } catch (Throwable ignored) {}
+                payload = plain;
+                continue;
+            }
+            break;
         }
-        int code = c.getResponseCode();
         if (code >= 400) {
             throw new ApiException("openrouter", code, readStr(c.getErrorStream()));
         }
@@ -13336,7 +13363,8 @@ class Brain {
     void produceGoogleTtsStream(String text, TtsStream st) throws Exception {
         String withVoice = "{\"contents\":[{\"parts\":[{\"text\":" + js(text) + "}]}],"
                          + "\"generationConfig\":{\"responseModalities\":[\"AUDIO\"],"
-                         + "\"speechConfig\":{\"voiceConfig\":{\"prebuiltVoiceConfig\":{\"voiceName\":\"Charon\"}}}}}";
+                         + "\"speechConfig\":{\"voiceConfig\":{\"prebuiltVoiceConfig\":{\"voiceName\":"
+                         + js(DEFAULT_GEMINI_VOICE) + "}}}}}";
         String plain = "{\"contents\":[{\"parts\":[{\"text\":" + js(text) + "}]}],"
                      + "\"generationConfig\":{\"responseModalities\":[\"AUDIO\"]}}";
         String url = GOOGLE_BASE + "/models/" + enc(GEMINI_TTS)
@@ -13474,7 +13502,8 @@ class Brain {
     byte[] synthesizeGoogle(String text) throws Exception {
         String withVoice = "{\"contents\":[{\"parts\":[{\"text\":" + js(text) + "}]}],"
                          + "\"generationConfig\":{\"responseModalities\":[\"AUDIO\"],"
-                         + "\"speechConfig\":{\"voiceConfig\":{\"prebuiltVoiceConfig\":{\"voiceName\":\"Charon\"}}}}}";
+                         + "\"speechConfig\":{\"voiceConfig\":{\"prebuiltVoiceConfig\":{\"voiceName\":"
+                         + js(DEFAULT_GEMINI_VOICE) + "}}}}}";
         String plain = "{\"contents\":[{\"parts\":[{\"text\":" + js(text) + "}]}],"
                      + "\"generationConfig\":{\"responseModalities\":[\"AUDIO\"]}}";
         String res;

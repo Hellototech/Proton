@@ -1555,9 +1555,6 @@ class ProtonFrame extends JFrame {
     // Siri-style wake activation overlay (never opens the main window).
     private SiriOverlay siri;
 
-    // Live Nemotron reasoning card (upper-right, never read aloud).
-    private ThoughtWindow thought;
-
     ProtonFrame() {
         super("PROTON AI");
         setUndecorated(true);
@@ -1599,7 +1596,6 @@ class ProtonFrame extends JFrame {
 
         wireEvents();
         wireCompanionHooks();
-        wireThoughtHooks();
 
         addWindowListener(new WindowAdapter() {
             public void windowClosing(WindowEvent e) { closeRequest(); }
@@ -1775,17 +1771,6 @@ class ProtonFrame extends JFrame {
             }
             public void exit(boolean completed) { self.exitCompanionMode(completed); }
             public boolean isAborted() { return s.abortTask; }
-        };
-    }
-
-    /* ---- Live Nemotron reasoning card (upper-right, silent) ---- */
-
-    private void wireThoughtHooks() {
-        thought = new ThoughtWindow();
-        brain.thoughtHooks = new Brain.ThoughtHooks() {
-            public void begin() { if (thought != null) thought.begin(); }
-            public void thought(String delta) { if (thought != null) thought.append(delta); }
-            public void end() { if (thought != null) thought.end(); }
         };
     }
 
@@ -2227,9 +2212,9 @@ class ProtonFrame extends JFrame {
         if (ticker != null) ticker.stop();
         if (micThread != null) micThread.stopCapture();
         brain.stopSpeaking();
+        try { brain.warmWinTts.shutdown(); } catch (Throwable ignored) {}
         try { if (companion != null) companion.disposeOverlay(); } catch (Throwable ignored) {}
         try { if (siri != null) siri.disposeOverlay(); } catch (Throwable ignored) {}
-        try { if (thought != null) thought.disposeWindow(); } catch (Throwable ignored) {}
         dispose();
         System.exit(0);
     }
@@ -2245,9 +2230,9 @@ class ProtonFrame extends JFrame {
         if (ticker != null) ticker.stop();
         if (micThread != null) micThread.stopCapture();
         try { brain.stopSpeaking(); } catch (Throwable ignored) {}
+        try { brain.warmWinTts.shutdown(); } catch (Throwable ignored) {}
         try { if (companion != null) companion.disposeOverlay(); } catch (Throwable ignored) {}
         try { if (siri != null) siri.disposeOverlay(); } catch (Throwable ignored) {}
-        try { if (thought != null) thought.disposeWindow(); } catch (Throwable ignored) {}
         dispose();
     }
 
@@ -2524,14 +2509,21 @@ class ProtonFrame extends JFrame {
         setThinking(true);
         Brain.refreshContextAsync();
         brain.earlySpeaker = spoken -> {
-            SwingUtilities.invokeLater(() -> {
-                if (gen != queryGen) return;
-                s.transcript = "\u201C" + spoken + "\u201D";
-                s.transcriptTtl = 6.5f;
-            });
-            s.speaking = true;
-            try { brain.speak(spoken); }
-            finally { s.speaking = false; }
+            final java.util.concurrent.atomic.AtomicBoolean done = new java.util.concurrent.atomic.AtomicBoolean(false);
+            try {
+                brain.speak(spoken, () -> {
+                    if (gen == queryGen && !done.get()) s.speaking = true;
+                    SwingUtilities.invokeLater(() -> {
+                        if (gen != queryGen || done.get()) return;
+                        s.speaking = true;
+                        s.transcript = "\u201C" + spoken + "\u201D";
+                        s.transcriptTtl = 6.5f;
+                    });
+                });
+            } finally {
+                done.set(true);
+                s.speaking = false;
+            }
         };
 
         new Thread(() -> {
@@ -2540,20 +2532,40 @@ class ProtonFrame extends JFrame {
                 if (reply == null || reply.trim().isEmpty()) reply = "done.";
                 final String r = reply.trim();
                 if (gen != queryGen) return;
-                SwingUtilities.invokeLater(() -> {
-                    if (gen != queryGen) return;
-                    s.transcript = "\u201C" + r + "\u201D";
-                    s.transcriptTtl = 6.5f;
-                    setThinking(false);
-                });
-                if (gen != queryGen) return;
                 // SPEAKING phase: orb/status reflect s.speaking via tick().
                 // (If Proton already acknowledged out loud while working, only the follow-up is spoken here.)
                 String toSay = brain.remainingSpeech(r);
-                if (toSay != null && !toSay.trim().isEmpty()) {
-                    s.speaking = true;
-                    try { brain.speak(toSay); }
-                    finally { s.speaking = false; }
+                if (toSay == null || toSay.trim().isEmpty()) {
+                    SwingUtilities.invokeLater(() -> {
+                        if (gen != queryGen) return;
+                        s.transcript = "\u201C" + r + "\u201D";
+                        s.transcriptTtl = 6.5f;
+                        setThinking(false);
+                    });
+                } else {
+                    final java.util.concurrent.atomic.AtomicBoolean speechDone = new java.util.concurrent.atomic.AtomicBoolean(false);
+                    try {
+                        brain.speak(toSay, () -> {
+                            if (gen == queryGen && !speechDone.get()) s.speaking = true;
+                            SwingUtilities.invokeLater(() -> {
+                                if (gen != queryGen) return;
+                                if (!speechDone.get()) s.speaking = true;
+                                s.transcript = "\u201C" + r + "\u201D";
+                                s.transcriptTtl = 6.5f;
+                                setThinking(false);
+                            });
+                        });
+                    } finally {
+                        speechDone.set(true);
+                        s.speaking = false;
+                    }
+                    if (gen == queryGen) {
+                        SwingUtilities.invokeLater(() -> {
+                            if (gen != queryGen) return;
+                            if (s.thinking) setThinking(false);
+                            s.speaking = false;
+                        });
+                    }
                 }
                 // Voice Mode hands-free loop only (Assistant mic is single-turn).
                 // STANDBY (speaking=false) -> 450ms cooldown -> LISTENING (startMic).
@@ -3551,6 +3563,248 @@ final class WHotkey extends Thread {
             + "  }\n"
             + "  Start-Sleep -Milliseconds 200\n"
             + "}\n";
+    }
+}
+
+/**
+ * Warm persistent Windows SAPI TTS worker (hidden PowerShell + System.Speech).
+ * Eliminates cold powershell.exe startup latency on local TTS fallback and
+ * supports instant SpeakAsyncCancelAll() barge-in.
+ */
+final class WarmWinTts {
+    private volatile boolean alive = true;
+    private volatile Process proc;
+    private volatile BufferedWriter stdinWriter;
+    private volatile Thread reader;
+
+    private final Object procLock = new Object();
+    private final Object speechLock = new Object();
+    private final Object waitLock = new Object();
+
+    private volatile boolean startedSignal = false;
+    private volatile boolean doneSignal = false;
+    private volatile boolean cancelled = false;
+
+    void warmUpAsync() {
+        if (!Brain.isWin() || !alive) return;
+        Thread t = new Thread(this::ensureStarted, "proton-win-tts-warm");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    boolean speak(String text, Runnable onAudioStart) {
+        if (!Brain.isWin() || !alive || text == null || text.trim().isEmpty()) return false;
+        synchronized (speechLock) {
+            if (!alive) return false;
+            if (!ensureStarted()) return false;
+            synchronized (waitLock) {
+                cancelled = false;
+                startedSignal = false;
+                doneSignal = false;
+            }
+            String b64 = Base64.getEncoder().encodeToString(text.getBytes(StandardCharsets.UTF_8));
+            if (!sendLine("SAY:" + b64)) {
+                killProc();
+                if (!ensureStarted() || !sendLine("SAY:" + b64)) return false;
+            }
+
+            long startDeadline = System.currentTimeMillis() + 10000L;
+            synchronized (waitLock) {
+                while (!startedSignal && !doneSignal && !cancelled && alive) {
+                    Process p = proc;
+                    if (p == null || !p.isAlive()) break;
+                    long rem = startDeadline - System.currentTimeMillis();
+                    if (rem <= 0) break;
+                    try { waitLock.wait(Math.min(100L, rem)); }
+                    catch (InterruptedException ie) { cancelled = true; break; }
+                }
+            }
+            if (cancelled || !alive) return true;
+            if (onAudioStart != null) {
+                try { onAudioStart.run(); } catch (Throwable ignored) {}
+            }
+            long doneDeadline = System.currentTimeMillis() + 120000L;
+            synchronized (waitLock) {
+                while (!doneSignal && !cancelled && alive) {
+                    Process p = proc;
+                    if (p == null || !p.isAlive()) break;
+                    long rem = doneDeadline - System.currentTimeMillis();
+                    if (rem <= 0) break;
+                    try { waitLock.wait(Math.min(200L, rem)); }
+                    catch (InterruptedException ie) { cancelled = true; break; }
+                }
+            }
+            return startedSignal || doneSignal || cancelled;
+        }
+    }
+
+    void stop() {
+        synchronized (waitLock) {
+            cancelled = true;
+            waitLock.notifyAll();
+        }
+        sendLine("STOP");
+    }
+
+    void shutdown() {
+        alive = false;
+        synchronized (waitLock) {
+            cancelled = true;
+            waitLock.notifyAll();
+        }
+        sendLine("EXIT");
+        Process p = proc;
+        if (p != null) {
+            try { p.waitFor(300, TimeUnit.MILLISECONDS); } catch (InterruptedException ignored) {}
+        }
+        killProc();
+    }
+
+    private boolean ensureStarted() {
+        synchronized (procLock) {
+            if (!alive) return false;
+            Process cur = proc;
+            if (cur != null && cur.isAlive() && stdinWriter != null) return true;
+            killProc();
+            try {
+                String enc = Base64.getEncoder().encodeToString(
+                        script().getBytes(StandardCharsets.UTF_16LE));
+                ProcessBuilder pb = new ProcessBuilder("powershell", "-NoProfile",
+                        "-NonInteractive", "-WindowStyle", "Hidden",
+                        "-ExecutionPolicy", "Bypass", "-EncodedCommand", enc);
+                pb.redirectErrorStream(true);
+                final Process p = pb.start();
+                final BufferedWriter bw = new BufferedWriter(
+                        new OutputStreamWriter(p.getOutputStream(), StandardCharsets.UTF_8));
+                proc = p;
+                stdinWriter = bw;
+                Thread r = new Thread(() -> {
+                    try (BufferedReader br = new BufferedReader(
+                            new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+                        String line;
+                        while (alive && proc == p && (line = br.readLine()) != null) {
+                            String cmd = line.trim();
+                            if ("START".equals(cmd)) {
+                                synchronized (waitLock) {
+                                    startedSignal = true;
+                                    waitLock.notifyAll();
+                                }
+                            } else if ("DONE".equals(cmd)) {
+                                synchronized (waitLock) {
+                                    doneSignal = true;
+                                    waitLock.notifyAll();
+                                }
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                    } finally {
+                        synchronized (waitLock) {
+                            if (proc == p) proc = null;
+                            waitLock.notifyAll();
+                        }
+                    }
+                }, "proton-win-tts-reader");
+                r.setDaemon(true);
+                reader = r;
+                r.start();
+                return true;
+            } catch (Throwable t) {
+                killProc();
+                return false;
+            }
+        }
+    }
+
+    private boolean sendLine(String cmd) {
+        BufferedWriter bw = stdinWriter;
+        Process p = proc;
+        if (bw == null || p == null || !p.isAlive()) return false;
+        try {
+            synchronized (bw) {
+                bw.write(cmd);
+                bw.newLine();
+                bw.flush();
+            }
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private void killProc() {
+        BufferedWriter bw = stdinWriter;
+        stdinWriter = null;
+        if (bw != null) { try { bw.close(); } catch (Throwable ignored) {} }
+        Process p = proc;
+        proc = null;
+        if (p != null) { try { p.destroy(); } catch (Throwable ignored) {} }
+        Thread r = reader;
+        reader = null;
+        if (r != null && r != Thread.currentThread()) {
+            try { r.join(250); } catch (InterruptedException ignored) {}
+        }
+    }
+
+    private static String script() {
+        return "$ErrorActionPreference='SilentlyContinue'\n"
+            + "Add-Type -AssemblyName System.Speech\n"
+            + "Add-Type -ReferencedAssemblies System.Speech -TypeDefinition @\"\n"
+            + "using System;\n"
+            + "using System.Speech.Synthesis;\n"
+            + "using System.Text;\n"
+            + "public class ProtonWinTts {\n"
+            + "    public static void Run() {\n"
+            + "        Console.InputEncoding = Encoding.UTF8;\n"
+            + "        Console.OutputEncoding = Encoding.UTF8;\n"
+            + "        using (var synth = new SpeechSynthesizer()) {\n"
+            + "            synth.Volume = 100;\n"
+            + "            synth.Rate = 1;\n"
+            + "            var stateLock = new object();\n"
+            + "            var outLock = new object();\n"
+            + "            Prompt currentPrompt = null;\n"
+            + "            Prompt cancelledPrompt = null;\n"
+            + "            synth.SpeakCompleted += (s, e) => {\n"
+            + "                lock (stateLock) {\n"
+            + "                    if (e.Prompt == cancelledPrompt) return;\n"
+            + "                    if (e.Prompt == currentPrompt) currentPrompt = null;\n"
+            + "                }\n"
+            + "                lock (outLock) {\n"
+            + "                    Console.WriteLine(\"DONE\");\n"
+            + "                    Console.Out.Flush();\n"
+            + "                }\n"
+            + "            };\n"
+            + "            string line;\n"
+            + "            while ((line = Console.In.ReadLine()) != null) {\n"
+            + "                if (line.StartsWith(\"SAY:\")) {\n"
+            + "                    lock (stateLock) {\n"
+            + "                        cancelledPrompt = currentPrompt;\n"
+            + "                        currentPrompt = null;\n"
+            + "                    }\n"
+            + "                    synth.SpeakAsyncCancelAll();\n"
+            + "                    string text = Encoding.UTF8.GetString(Convert.FromBase64String(line.Substring(4)));\n"
+            + "                    lock (outLock) {\n"
+            + "                        Console.WriteLine(\"START\");\n"
+            + "                        Console.Out.Flush();\n"
+            + "                    }\n"
+            + "                    lock (stateLock) {\n"
+            + "                        currentPrompt = synth.SpeakAsync(text);\n"
+            + "                    }\n"
+            + "                } else if (line == \"STOP\") {\n"
+            + "                    synth.SpeakAsyncCancelAll();\n"
+            + "                } else if (line == \"EXIT\") {\n"
+            + "                    lock (stateLock) {\n"
+            + "                        cancelledPrompt = currentPrompt;\n"
+            + "                        currentPrompt = null;\n"
+            + "                    }\n"
+            + "                    synth.SpeakAsyncCancelAll();\n"
+            + "                    break;\n"
+            + "                }\n"
+            + "            }\n"
+            + "        }\n"
+            + "    }\n"
+            + "}\n"
+            + "\"@\n"
+            + "[ProtonWinTts]::Run()\n";
     }
 }
 
@@ -5474,15 +5728,20 @@ final class SiriOverlay {
 
         brain.earlySpeaker = spoken -> {
             if (!active || dismissing) return;
-            SwingUtilities.invokeLater(() -> {
-                if (active && !dismissing) {
-                    s.thinking = false;
-                    s.speaking = true;
-                    status = "Speaking...";
-                }
-            });
-            try { brain.speak(spoken); }
-            finally {
+            final java.util.concurrent.atomic.AtomicBoolean done = new java.util.concurrent.atomic.AtomicBoolean(false);
+            try {
+                brain.speak(spoken, () -> {
+                    if (!done.get()) s.speaking = true;
+                    SwingUtilities.invokeLater(() -> {
+                        if (active && !dismissing && !done.get()) {
+                            s.thinking = false;
+                            s.speaking = true;
+                            status = "Speaking...";
+                        }
+                    });
+                });
+            } finally {
+                done.set(true);
                 SwingUtilities.invokeLater(() -> {
                     if (active && !dismissing) {
                         s.speaking = false;
@@ -5512,14 +5771,23 @@ final class SiriOverlay {
             final String say = toSay == null ? "" : toSay.trim();
 
             if (!say.isEmpty()) {
-                s.thinking = false;
-                s.speaking = true;
-                SwingUtilities.invokeLater(() -> {
-                    if (active && !dismissing && g == turn) status = "Speaking...";
-                });
-                try { brain.speak(say); }
-                catch (Throwable ignored) {}
-                finally { s.speaking = false; }
+                final java.util.concurrent.atomic.AtomicBoolean done = new java.util.concurrent.atomic.AtomicBoolean(false);
+                try {
+                    brain.speak(say, () -> {
+                        if (!done.get()) s.speaking = true;
+                        SwingUtilities.invokeLater(() -> {
+                            if (active && !dismissing && g == turn && !done.get()) {
+                                s.thinking = false;
+                                s.speaking = true;
+                                status = "Speaking...";
+                            }
+                        });
+                    });
+                } catch (Throwable ignored) {}
+                finally {
+                    done.set(true);
+                    s.speaking = false;
+                }
             }
 
             SwingUtilities.invokeLater(() -> {
@@ -5796,204 +6064,6 @@ class SiriStage extends JPanel {
         int tx = bx + 22;
         int ty = py + (ph + fm.getAscent() - fm.getDescent()) / 2;
         g2.drawString(label, tx, ty);
-    }
-}
-
-/* =============================================================== */
-/*  THOUGHT WINDOW -- live Nemotron reasoning in liquid glass       */
-/* =============================================================== */
-
-@SuppressWarnings("serial")
-class ThoughtWindow extends JWindow {
-    private static final int W = 404;
-    private static final int H = 262;
-
-    private final JTextArea area = new JTextArea();
-    private final Glass glass = new Glass();
-    private final StringBuilder pending = new StringBuilder();
-    private final Object lock = new Object();
-    private final javax.swing.Timer flush;
-    private final javax.swing.Timer pulse;
-    private final javax.swing.Timer fade;
-
-    private volatile boolean active;
-    private volatile int gen;
-    private float alpha = 0f, target = 0f;
-    private boolean hideWhenZero;
-    private float phase;
-
-    ThoughtWindow() {
-        setBackground(new Color(0, 0, 0, 0));
-        setFocusableWindowState(false);
-        setAutoRequestFocus(false);
-        setAlwaysOnTop(true);
-        try { setType(Window.Type.UTILITY); } catch (Throwable ignored) {}
-        setSize(W, H);
-
-        area.setEditable(false);
-        area.setOpaque(false);
-        area.setLineWrap(true);
-        area.setWrapStyleWord(true);
-        area.setFocusable(false);
-        area.setForeground(new Color(0xDCE1FF));
-        area.setFont(Fnt.get(Font.PLAIN, 11.5f));
-        area.setBorder(new EmptyBorder(0, 0, 0, 0));
-
-        JScrollPane sp = new JScrollPane(area);
-        sp.setOpaque(false);
-        sp.getViewport().setOpaque(false);
-        sp.setBorder(null);
-        sp.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
-        sp.setVerticalScrollBarPolicy(ScrollPaneConstants.VERTICAL_SCROLLBAR_NEVER);
-
-        glass.setOpaque(false);
-        glass.setLayout(new BorderLayout());
-        glass.setBorder(new EmptyBorder(46, 18, 16, 18));
-        glass.add(sp, BorderLayout.CENTER);
-        setContentPane(glass);
-
-        flush = new javax.swing.Timer(60, e -> flushPending());
-        flush.setCoalesce(true);
-        pulse = new javax.swing.Timer(50, e -> { phase += 0.10f; glass.repaint(); });
-        fade = new javax.swing.Timer(16, e -> tickFade());
-    }
-
-    void begin() {
-        if (SwingUtilities.isEventDispatchThread()) beginEdt();
-        else SwingUtilities.invokeLater(this::beginEdt);
-    }
-
-    private void beginEdt() {
-        gen++;
-        active = true;
-        synchronized (lock) { pending.setLength(0); }
-        area.setText("");
-        position();
-        if (!isVisible()) alpha = 0f;
-        target = 1f;
-        hideWhenZero = false;
-        setVisible(true);
-        toFront();
-        flush.start();
-        pulse.start();
-        if (!fade.isRunning()) fade.start();
-    }
-
-    void append(String delta) {
-        if (delta == null || delta.isEmpty()) return;
-        synchronized (lock) {
-            pending.append(delta);
-            if (pending.length() > 7000) pending.delete(0, pending.length() - 7000);
-        }
-    }
-
-    void end() {
-        final int g = gen;
-        SwingUtilities.invokeLater(() -> {
-            flushPending();
-            javax.swing.Timer wait = new javax.swing.Timer(450, e -> {
-                ((javax.swing.Timer) e.getSource()).stop();
-                if (gen != g) return;   // a newer stream already started
-                target = 0f;
-                hideWhenZero = true;
-                if (!fade.isRunning()) fade.start();
-            });
-            wait.setRepeats(false);
-            wait.start();
-        });
-    }
-
-    void disposeWindow() {
-        SwingUtilities.invokeLater(() -> {
-            active = false;
-            flush.stop();
-            pulse.stop();
-            fade.stop();
-            setVisible(false);
-            dispose();
-        });
-    }
-
-    private void flushPending() {
-        if (!active) return;
-        String add;
-        synchronized (lock) {
-            if (pending.length() == 0) return;
-            add = pending.toString();
-            pending.setLength(0);
-        }
-        String text = area.getText() + add;
-        if (text.length() > 6000) text = text.substring(text.length() - 6000);
-        area.setText(text);
-        area.setCaretPosition(text.length());
-    }
-
-    private void tickFade() {
-        if (alpha < target) alpha = Math.min(target, alpha + 0.14f);
-        else if (alpha > target) alpha = Math.max(target, alpha - 0.14f);
-        try { setOpacity(Math.max(0.01f, alpha)); } catch (Throwable ignored) {}
-        glass.repaint();
-        if (Math.abs(alpha - target) < 0.01f) {
-            fade.stop();
-            if (target == 0f && hideWhenZero) {
-                active = false;
-                hideWhenZero = false;
-                flush.stop();
-                pulse.stop();
-                setVisible(false);
-            }
-        }
-    }
-
-    private void position() {
-        try {
-            Rectangle b = GraphicsEnvironment.getLocalGraphicsEnvironment().getMaximumWindowBounds();
-            setLocation(b.x + b.width - getWidth() - 22, b.y + 22);
-        } catch (Throwable ignored) {}
-    }
-
-    /** Paints the liquid-glass card and its live THINKING header. */
-    private final class Glass extends JPanel {
-        Glass() { setOpaque(false); }
-
-        @Override
-        protected void paintComponent(Graphics g) {
-            Graphics2D g2 = (Graphics2D) g.create();
-            try {
-                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-                g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
-                int w = getWidth(), h = getHeight();
-                float a = Math.max(0f, Math.min(1f, alpha));
-                RoundRectangle2D rr = new RoundRectangle2D.Float(0.5f, 0.5f, w - 1, h - 1, 22, 22);
-                g2.setColor(new Color(9, 8, 20, (int) (238 * a)));
-                g2.fill(rr);
-                g2.setPaint(new GradientPaint(0, 0, new Color(255, 255, 255, (int) (24 * a)),
-                        0, h, new Color(255, 255, 255, (int) (4 * a))));
-                g2.fill(rr);
-                g2.setColor(new Color(255, 255, 255, (int) (40 * a)));
-                g2.setStroke(new BasicStroke(1f));
-                g2.draw(rr);
-
-                float pulseAmt = 0.55f + 0.45f * (float) Math.sin(phase);
-                g2.setColor(new Color(120, 180, 255, (int) (a * 70 * pulseAmt)));
-                g2.fill(new Ellipse2D.Float(14, 16, 16, 16));
-                g2.setColor(new Color(150, 205, 255, (int) (a * 255)));
-                g2.fill(new Ellipse2D.Float(19, 21, 6, 6));
-
-                g2.setFont(Fnt.get(Font.BOLD, 9.5f));
-                g2.setColor(new Color(0x9A9CB4));
-                g2.drawString("THINKING", 36, 28);
-                String tag = "NEMOTRON";
-                FontMetrics fm = g2.getFontMetrics();
-                g2.setColor(new Color(0x6F7390));
-                g2.drawString(tag, w - 18 - fm.stringWidth(tag), 28);
-
-                g2.setColor(new Color(255, 255, 255, (int) (22 * a)));
-                g2.drawLine(18, 38, w - 18, 38);
-            } finally {
-                g2.dispose();
-            }
-        }
     }
 }
 
@@ -8258,11 +8328,41 @@ class Brain {
         return fgCacheTitle;
     }
 
-    // speech playback control (barge-in)
+    // speech playback control (barge-in) & TTS circuit breakers
+    static final byte[] TTS_EOF = new byte[0];
     volatile boolean speechCancelled = false;
+    volatile long openrouterTtsBlockedUntil = 0L;
+    volatile long geminiTtsBlockedUntil = 0L;
     volatile Clip activeClip;
     volatile SourceDataLine activeLine;
     volatile Process speechProc;
+    final WarmWinTts warmWinTts = new WarmWinTts();
+    final List<TtsStream> activeTtsStreams = java.util.Collections.synchronizedList(new ArrayList<>());
+
+    static final class TtsStream {
+        final java.util.concurrent.BlockingQueue<byte[]> queue = new java.util.concurrent.LinkedBlockingQueue<>();
+        volatile AudioFormat format = new AudioFormat(AudioFormat.Encoding.PCM_SIGNED, 24000f, 16, 1, 2, 24000f, false);
+        volatile Throwable error;
+        volatile boolean ready = false;
+        volatile boolean closed = false;
+        volatile boolean hasAudio = false;
+        volatile HttpURLConnection conn;
+        final Object readyLock = new Object();
+
+        void signalReady() {
+            ready = true;
+            synchronized (readyLock) { readyLock.notifyAll(); }
+        }
+
+        void abort() {
+            closed = true;
+            queue.clear();
+            queue.offer(TTS_EOF);
+            HttpURLConnection c = conn;
+            if (c != null) { try { c.disconnect(); } catch (Throwable ignored) {} }
+            signalReady();
+        }
+    }
 
     /* ---- Corner Mini-Orb Companion HUD hooks (wired by ProtonFrame) ---- */
     interface CompanionHooks {
@@ -8278,14 +8378,6 @@ class Brain {
         CompanionAbort() { super("aborted"); }
     }
     volatile CompanionHooks companion;
-
-    /* ---- Live "thinking" stream hooks (wired by ProtonFrame) ---- */
-    interface ThoughtHooks {
-        void begin();
-        void thought(String delta);
-        void end();
-    }
-    volatile ThoughtHooks thoughtHooks;
 
     /* ---- PROTON's own coding IDE (read-only for the user) ---- */
     volatile ProtonIDE codeIde;
@@ -8440,49 +8532,38 @@ class Brain {
     }
 
     String orStream(String model, String msgsJson, int maxTokens, double temp,
-                    boolean showThoughts) throws Exception {
-        ThoughtHooks hooks = showThoughts ? thoughtHooks : null;
-        if (hooks != null) try { hooks.begin(); } catch (Throwable ignored) {}
-        try {
-            HttpURLConnection c = orConn("/chat/completions", 180000);
-            c.setRequestMethod("POST");
-            c.setDoOutput(true);
-            c.setRequestProperty("Content-Type", "application/json");
-            c.setRequestProperty("Accept", "text/event-stream");
-            String body = "{\"model\":" + js(model) + ",\"messages\":[" + msgsJson + "],"
-                        + "\"stream\":true,\"max_tokens\":" + maxTokens + ",\"temperature\":" + temp + "}";
-            try (OutputStream o = c.getOutputStream()) {
-                o.write(body.getBytes(StandardCharsets.UTF_8));
-            }
-            int code = c.getResponseCode();
-            if (code >= 400) {
-                throw new ApiException("openrouter", code, readStr(c.getErrorStream()));
-            }
-            StringBuilder answer = new StringBuilder();
-            try (BufferedReader br = new BufferedReader(
-                    new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8))) {
-                String line;
-                while ((line = br.readLine()) != null) {
-                    if (line.isEmpty() || line.startsWith(":")) continue;
-                    if (!line.startsWith("data:")) continue;
-                    String data = line.substring(5).trim();
-                    if ("[DONE]".equals(data)) break;
-                    try {
-                        Object root = jparse(data);
-                        Object r = dig(root, "choices", 0, "delta", "reasoning_content");
-                        if (r == null) r = dig(root, "choices", 0, "delta", "reasoning");
-                        if (r != null && !r.toString().isEmpty() && hooks != null) {
-                            try { hooks.thought(r.toString()); } catch (Throwable ignored) {}
-                        }
-                        Object ct = dig(root, "choices", 0, "delta", "content");
-                        if (ct != null) answer.append(ct.toString());
-                    } catch (Throwable ignored) {}
-                }
-            }
-            return answer.toString();
-        } finally {
-            if (hooks != null) try { hooks.end(); } catch (Throwable ignored) {}
+                    boolean unusedShowThoughts) throws Exception {
+        HttpURLConnection c = orConn("/chat/completions", 180000);
+        c.setRequestMethod("POST");
+        c.setDoOutput(true);
+        c.setRequestProperty("Content-Type", "application/json");
+        c.setRequestProperty("Accept", "text/event-stream");
+        String body = "{\"model\":" + js(model) + ",\"messages\":[" + msgsJson + "],"
+                    + "\"stream\":true,\"max_tokens\":" + maxTokens + ",\"temperature\":" + temp + "}";
+        try (OutputStream o = c.getOutputStream()) {
+            o.write(body.getBytes(StandardCharsets.UTF_8));
         }
+        int code = c.getResponseCode();
+        if (code >= 400) {
+            throw new ApiException("openrouter", code, readStr(c.getErrorStream()));
+        }
+        StringBuilder answer = new StringBuilder();
+        try (BufferedReader br = new BufferedReader(
+                new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                if (line.isEmpty() || line.startsWith(":")) continue;
+                if (!line.startsWith("data:")) continue;
+                String data = line.substring(5).trim();
+                if ("[DONE]".equals(data)) break;
+                try {
+                    Object root = jparse(data);
+                    Object ct = dig(root, "choices", 0, "delta", "content");
+                    if (ct != null) answer.append(ct.toString());
+                } catch (Throwable ignored) {}
+            }
+        }
+        return answer.toString();
     }
 
     String googlePostRaw(String model, String method, String jsonBody, int readTimeoutMs) throws Exception {
@@ -8587,25 +8668,11 @@ class Brain {
     }
 
     String googleStream(String model, String msgsJson, int maxTokens, double temp,
-                        boolean showThoughts) throws Exception {
-        ThoughtHooks hooks = showThoughts ? thoughtHooks : null;
-        if (hooks != null) try { hooks.begin(); } catch (Throwable ignored) {}
-        try {
-            try {
-                return googleStreamOnce(model, msgsJson, maxTokens, temp, showThoughts, hooks);
-            } catch (ApiException ex) {
-                if (showThoughts && ex.status == 400) {
-                    return googleStreamOnce(model, msgsJson, maxTokens, temp, false, hooks);
-                }
-                throw ex;
-            }
-        } finally {
-            if (hooks != null) try { hooks.end(); } catch (Throwable ignored) {}
-        }
+                        boolean unusedShowThoughts) throws Exception {
+        return googleStreamOnce(model, msgsJson, maxTokens, temp);
     }
 
-    private String googleStreamOnce(String model, String msgsJson, int maxTokens, double temp,
-                                    boolean includeThoughts, ThoughtHooks hooks) throws Exception {
+    private String googleStreamOnce(String model, String msgsJson, int maxTokens, double temp) throws Exception {
         String url = GOOGLE_BASE + "/models/" + enc(model)
                    + ":streamGenerateContent?alt=sse&key=" + enc(googleKey);
         HttpURLConnection c = (HttpURLConnection) URI.create(url).toURL().openConnection();
@@ -8615,7 +8682,7 @@ class Brain {
         c.setReadTimeout(180000);
         c.setRequestProperty("Content-Type", "application/json");
         c.setRequestProperty("Accept", "text/event-stream");
-        String body = toGeminiBody(msgsJson, maxTokens, temp, includeThoughts, null);
+        String body = toGeminiBody(msgsJson, maxTokens, temp, false, null);
         try (OutputStream o = c.getOutputStream()) {
             o.write(body.getBytes(StandardCharsets.UTF_8));
         }
@@ -8639,13 +8706,9 @@ class Brain {
                         for (Object po : (List<?>) parts) {
                             if (!(po instanceof Map)) continue;
                             Map<?, ?> pm = (Map<?, ?>) po;
+                            if (Boolean.TRUE.equals(pm.get("thought"))) continue;
                             Object t = pm.get("text");
-                            if (t == null || t.toString().isEmpty()) continue;
-                            if (Boolean.TRUE.equals(pm.get("thought"))) {
-                                if (hooks != null) {
-                                    try { hooks.thought(t.toString()); } catch (Throwable ignored) {}
-                                }
-                            } else {
+                            if (t != null && !t.toString().isEmpty()) {
                                 answer.append(t.toString());
                             }
                         }
@@ -9821,114 +9884,240 @@ class Brain {
     /** Immediately stops whatever the assistant is saying. */
     void stopSpeaking() {
         speechCancelled = true;
+        synchronized (activeTtsStreams) {
+            for (TtsStream st : activeTtsStreams) {
+                try { st.abort(); } catch (Throwable ignored) {}
+            }
+            activeTtsStreams.clear();
+        }
+        try { warmWinTts.stop(); } catch (Throwable ignored) {}
         Clip c = activeClip;
-        if (c != null) { try { c.stop(); } catch (Throwable ignored) {} }
+        if (c != null) { try { c.stop(); c.close(); } catch (Throwable ignored) {} }
         SourceDataLine sl = activeLine;
-        if (sl != null) { try { sl.stop(); sl.flush(); } catch (Throwable ignored) {} }
+        if (sl != null) { try { sl.stop(); sl.flush(); sl.close(); } catch (Throwable ignored) {} }
         Process p = speechProc;
         if (p != null) { try { p.destroy(); } catch (Throwable ignored) {} }
     }
 
+    static boolean isOpenRouterTtsRateLimited(Throwable t) {
+        if (t instanceof ApiException) {
+            int s = ((ApiException) t).status;
+            if (s == 429 || s == 502 || s == 503) return true;
+        }
+        String m = String.valueOf(t == null ? "" : t.getMessage()).toLowerCase(Locale.ROOT);
+        return m.contains("429") || m.contains("502") || m.contains("503");
+    }
+
+    static boolean isGeminiTtsRateLimited(Throwable t) {
+        if (t instanceof ApiException && ((ApiException) t).status == 429) return true;
+        String m = String.valueOf(t == null ? "" : t.getMessage()).toLowerCase(Locale.ROOT);
+        return m.contains("429") || m.contains("resource_exhausted");
+    }
+
     void speak(String text) {
-        if (text == null || text.trim().isEmpty()) return;
+        speak(text, null);
+    }
+
+    void speak(String text, Runnable onAudioStart) {
+        if (text == null || text.trim().isEmpty()) {
+            if (onAudioStart != null) try { onAudioStart.run(); } catch (Throwable ignored) {}
+            return;
+        }
         speechCancelled = false;
+        final boolean[] fired = {false};
+        Runnable fireOnce = () -> {
+            if (!fired[0]) {
+                fired[0] = true;
+                if (onAudioStart != null) {
+                    try { onAudioStart.run(); } catch (Throwable ignored) {}
+                }
+            }
+        };
         boolean played = false;
-        if (hasOpenRouter() && !speechCancelled) {
+        long now = System.currentTimeMillis();
+        if (hasOpenRouter() && !speechCancelled && now >= openrouterTtsBlockedUntil) {
             try {
-                played = speakWith(text, false);
+                played = speakWith(text, false, fireOnce);
             } catch (Throwable t) {
-                log("openrouter tts failed: " + shortStr(String.valueOf(t.getMessage())));
+                if (isOpenRouterTtsRateLimited(t)) {
+                    openrouterTtsBlockedUntil = System.currentTimeMillis() + 5 * 60_000L;
+                    log("openrouter tts rate-limited (" + shortStr(String.valueOf(t.getMessage())) + ") - cooling down 5m");
+                } else {
+                    log("openrouter tts failed: " + shortStr(String.valueOf(t.getMessage())));
+                }
             }
         }
-        if (!played && hasGoogle() && !speechCancelled) {
+        now = System.currentTimeMillis();
+        if (!played && hasGoogle() && !speechCancelled && now >= geminiTtsBlockedUntil) {
             try {
-                played = speakWith(text, true);
+                played = speakWith(text, true, fireOnce);
             } catch (Throwable t) {
-                log("google tts failed: " + shortStr(String.valueOf(t.getMessage())));
+                if (isGeminiTtsRateLimited(t)) {
+                    String m = String.valueOf(t.getMessage()).toLowerCase(Locale.ROOT);
+                    long cd = (m.contains("daily") || m.contains("quota")) ? 60 * 60_000L : 30 * 60_000L;
+                    geminiTtsBlockedUntil = System.currentTimeMillis() + cd;
+                    log("google tts rate-limited (" + shortStr(String.valueOf(t.getMessage()))
+                            + ") - cooling down " + (cd / 60_000L) + "m");
+                } else {
+                    log("google tts failed: " + shortStr(String.valueOf(t.getMessage())));
+                }
             }
         }
-        if (!played && !speechCancelled) speakNative(text);
-    }
-
-    /** Splits text into <= max-char pieces on sentence/clause/word boundaries. */
-    static List<String> ttsChunks(String text, int max) {
-        List<String> out = new ArrayList<>();
-        String t = text.replaceAll("\\s+", " ").trim();
-        if (t.length() <= max) { if (!t.isEmpty()) out.add(t); return out; }
-        StringBuilder cur = new StringBuilder();
-        for (String sent : t.split("(?<=[.!?;:])\\s+")) {
-            while (sent.length() > max) {
-                int cut = sent.lastIndexOf(", ", max);
-                if (cut < max / 3) cut = sent.lastIndexOf(' ', max);
-                if (cut < 1) cut = max;
-                String head = sent.substring(0, Math.min(sent.length(), cut + 1)).trim();
-                sent = sent.substring(Math.min(sent.length(), cut + 1)).trim();
-                if (cur.length() > 0 && cur.length() + 1 + head.length() > max) { out.add(cur.toString()); cur.setLength(0); }
-                if (cur.length() > 0) cur.append(' ');
-                cur.append(head);
-                out.add(cur.toString()); cur.setLength(0);
+        if (!played && !speechCancelled) {
+            if (isWin()) {
+                played = warmWinTts.speak(text, fireOnce);
             }
-            if (sent.isEmpty()) continue;
-            if (cur.length() > 0 && cur.length() + 1 + sent.length() > max) { out.add(cur.toString()); cur.setLength(0); }
-            if (cur.length() > 0) cur.append(' ');
-            cur.append(sent);
+            if (!played && !speechCancelled) {
+                fireOnce.run();
+                speakNative(text);
+            }
         }
-        if (cur.length() > 0) out.add(cur.toString());
-        return out;
+        if (!speechCancelled) fireOnce.run();
     }
 
-    /** Splits the first chunk after its first sentence/clause so audio starts as early as possible. */
-    static List<String> shortFirst(List<String> parts) {
-        String f = parts.get(0);
-        if (f.length() <= 110) return parts;
-        int cut = -1;
-        java.util.regex.Matcher m = java.util.regex.Pattern.compile("[.!?;:]\\s").matcher(f);
-        while (m.find()) { if (m.end() >= 24 && m.end() <= 150) { cut = m.end(); break; } }
-        if (cut < 0) {
-            java.util.regex.Matcher c = java.util.regex.Pattern.compile(",\\s").matcher(f);
-            while (c.find()) { if (c.end() >= 40 && c.end() <= 130) { cut = c.end(); break; } }
-        }
-        if (cut < 0 || cut >= f.length() - 8) return parts;
-        List<String> out = new ArrayList<>();
-        out.add(f.substring(0, cut).trim());
-        out.add(f.substring(cut).trim());
-        for (int i = 1; i < parts.size(); i++) out.add(parts.get(i));
-        return out;
-    }
-
-    /** Synthesizes + plays with one provider. Long text is chunked; the next chunk is
-     *  fetched while the current one plays. Returns true once playback started/finished. */
-    boolean speakWith(String text, boolean useGoogle) throws Exception {
-        List<String> parts = ttsChunks(text, 450);
-        if (parts.isEmpty()) return true;
-        if (parts.size() > 1) parts = shortFirst(parts);
-        java.util.concurrent.CompletableFuture<byte[]> next = fetchTts(parts.get(0), useGoogle);
+    /** Streams the full reply in a single HTTP request directly into SourceDataLine. */
+    boolean speakWith(String text, boolean useGoogle, Runnable onAudioStart) throws Exception {
+        String clean = text == null ? "" : text.replaceAll("\\s+", " ").trim();
+        if (clean.isEmpty()) return true;
+        TtsStream st = startTtsStream(clean, useGoogle);
+        SourceDataLine[] lineHolder = new SourceDataLine[1];
+        AudioFormat[] lineFmt = new AudioFormat[1];
         boolean started = false;
-        for (int i = 0; i < parts.size(); i++) {
-            if (speechCancelled) return true;
-            byte[] wav;
-            try { wav = next.get(40, TimeUnit.SECONDS); }
-            catch (Throwable t) {
-                if (!started) throw (t.getCause() instanceof Exception ? (Exception) t.getCause() : new Exception(t));
-                return true;
+        try {
+            if (speechCancelled) return false;
+            awaitStreamReady(st, 25000);
+            if (speechCancelled) return false;
+            if (st.error != null && !st.hasAudio) {
+                Throwable err = st.error;
+                throw (err instanceof Exception ? (Exception) err : new Exception(err));
             }
-            next = (i + 1 < parts.size()) ? fetchTts(parts.get(i + 1), useGoogle) : null;
-            playWav(wav);
-            started = true;
-            if (next == null) break;
+            started = playTtsStream(st, lineHolder, lineFmt, onAudioStart);
+        } finally {
+            st.abort();
+            activeTtsStreams.remove(st);
+            SourceDataLine line = lineHolder[0];
+            if (line != null) {
+                if (!speechCancelled) { try { line.drain(); } catch (Throwable ignored) {} }
+                try { line.stop(); } catch (Throwable ignored) {}
+                try { line.flush(); } catch (Throwable ignored) {}
+                try { line.close(); } catch (Throwable ignored) {}
+                if (activeLine == line) activeLine = null;
+            }
         }
-        return true;
+        return started;
     }
 
-    private java.util.concurrent.CompletableFuture<byte[]> fetchTts(String t, boolean useGoogle) {
-        java.util.concurrent.CompletableFuture<byte[]> f = new java.util.concurrent.CompletableFuture<>();
+    private TtsStream startTtsStream(String text, boolean useGoogle) {
+        TtsStream st = new TtsStream();
+        activeTtsStreams.add(st);
         Thread th = new Thread(() -> {
-            try { f.complete(useGoogle ? synthesizeGoogle(t) : synthesizeOpenRouter(t)); }
-            catch (Throwable ex) { f.completeExceptionally(ex); }
-        }, "tts-fetch");
+            try {
+                if (useGoogle) produceGoogleTtsStream(text, st);
+                else produceOpenRouterTtsStream(text, st);
+            } catch (Throwable ex) {
+                st.error = ex;
+            } finally {
+                st.queue.offer(TTS_EOF);
+                st.signalReady();
+            }
+        }, "tts-stream");
         th.setDaemon(true);
         th.start();
-        return f;
+        return st;
+    }
+
+    private void awaitStreamReady(TtsStream st, long timeoutMs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        synchronized (st.readyLock) {
+            while (!st.ready && !st.closed && !speechCancelled) {
+                long rem = deadline - System.currentTimeMillis();
+                if (rem <= 0) {
+                    if (st.error == null) st.error = new Exception("tts stream timed out");
+                    break;
+                }
+                try { st.readyLock.wait(Math.min(200, rem)); }
+                catch (InterruptedException ie) { break; }
+            }
+        }
+    }
+
+    private boolean playTtsStream(TtsStream st, SourceDataLine[] lineHolder,
+                                  AudioFormat[] lineFmt, Runnable onAudioStart) throws Exception {
+        AudioFormat af = st.format;
+        int frame = Math.max(1, af.getFrameSize());
+        // ~150 ms startup buffer so playback begins fast without underrun stutter
+        int targetBuf = Math.max(frame, ((int) (af.getSampleRate() * frame * 0.150)) / frame * frame);
+        ByteArrayOutputStream prebuf = new ByteArrayOutputStream(targetBuf + 4096);
+        boolean eofReached = false;
+        while (!speechCancelled && !st.closed && prebuf.size() < targetBuf) {
+            byte[] chunk = st.queue.poll(25, TimeUnit.SECONDS);
+            if (chunk == null) break;
+            if (chunk == TTS_EOF) { eofReached = true; break; }
+            prebuf.write(chunk, 0, chunk.length);
+        }
+        if (speechCancelled || st.closed) return false;
+        byte[] initial = prebuf.toByteArray();
+        if (initial.length == 0) {
+            if (st.error != null) {
+                Throwable err = st.error;
+                throw (err instanceof Exception ? (Exception) err : new Exception(err));
+            }
+            return false;
+        }
+
+        SourceDataLine line = lineHolder[0];
+        if (line == null || lineFmt[0] == null || !af.matches(lineFmt[0])) {
+            if (line != null) {
+                if (!speechCancelled) { try { line.drain(); } catch (Throwable ignored) {} }
+                try { line.stop(); line.flush(); line.close(); } catch (Throwable ignored) {}
+            }
+            line = (SourceDataLine) AudioSystem.getLine(new DataLine.Info(SourceDataLine.class, af));
+            line.open(af, Math.max(16384, targetBuf * 2));
+            line.start();
+            lineHolder[0] = line;
+            lineFmt[0] = af;
+            activeLine = line;
+        }
+
+        byte[] carry = new byte[frame];
+        int carryLen = 0;
+
+        int aligned = (initial.length / frame) * frame;
+        if (aligned > 0) {
+            line.write(initial, 0, aligned);
+            if (onAudioStart != null) onAudioStart.run();
+        }
+        int left = initial.length - aligned;
+        if (left > 0) {
+            System.arraycopy(initial, aligned, carry, 0, left);
+            carryLen = left;
+        }
+
+        if (!eofReached) {
+            while (!speechCancelled && !st.closed) {
+                byte[] chunk = st.queue.poll(25, TimeUnit.SECONDS);
+                if (chunk == null || chunk == TTS_EOF) break;
+                if (chunk.length == 0) continue;
+                if (carryLen > 0) {
+                    byte[] merged = new byte[carryLen + chunk.length];
+                    System.arraycopy(carry, 0, merged, 0, carryLen);
+                    System.arraycopy(chunk, 0, merged, carryLen, chunk.length);
+                    chunk = merged;
+                    carryLen = 0;
+                }
+                int wlen = (chunk.length / frame) * frame;
+                if (wlen > 0) {
+                    line.write(chunk, 0, wlen);
+                    if (onAudioStart != null) onAudioStart.run();
+                }
+                int rem = chunk.length - wlen;
+                if (rem > 0) {
+                    System.arraycopy(chunk, wlen, carry, 0, rem);
+                    carryLen = rem;
+                }
+            }
+        }
+        return true;
     }
 
     void remember(String role, String content) {
@@ -10019,8 +10208,9 @@ class Brain {
         return winCache;
     }
 
-    /** Opens the TLS connection and primes the caches while the user is still looking at the window. */
+    /** Opens the TLS connection, pre-warms local Windows TTS, and primes caches. */
     void warmUp() {
+        warmWinTts.warmUpAsync();
         if (!hasKey()) return;
         Thread t = new Thread(() -> {
             try { fgCacheTime = 0L; getForegroundTitle(); openWindows(true); } catch (Throwable ignored) {}
@@ -13070,6 +13260,214 @@ class Brain {
             throw new Exception("openrouter tts invalid audio: " + preview);
         }
         return audio;
+    }
+
+    private static byte[] float32ToPcm16(byte[] src, int len) {
+        int usable = len - (len % 4);
+        int samples = usable / 4;
+        byte[] out = new byte[samples * 2];
+        for (int i = 0; i < samples; i++) {
+            int bi = i * 4;
+            float f = Float.intBitsToFloat((src[bi] & 0xFF) | ((src[bi + 1] & 0xFF) << 8)
+                    | ((src[bi + 2] & 0xFF) << 16) | ((src[bi + 3] & 0xFF) << 24));
+            int v = Math.round(Math.max(-1f, Math.min(1f, f)) * 32767f);
+            out[i * 2] = (byte) v;
+            out[i * 2 + 1] = (byte) (v >> 8);
+        }
+        return out;
+    }
+
+    void produceOpenRouterTtsStream(String text, TtsStream st) throws Exception {
+        String json = "{\"model\":" + js(OR_TTS_MODEL) + ",\"input\":" + js(text)
+                    + ",\"response_format\":\"pcm\"}";
+        HttpURLConnection c = orConn("/audio/speech", 60000);
+        st.conn = c;
+        c.setRequestMethod("POST");
+        c.setDoOutput(true);
+        c.setRequestProperty("Content-Type", "application/json");
+        try (OutputStream o = c.getOutputStream()) {
+            o.write(json.getBytes(StandardCharsets.UTF_8));
+        }
+        int code = c.getResponseCode();
+        if (code >= 400) {
+            throw new ApiException("openrouter", code, readStr(c.getErrorStream()));
+        }
+
+        String contentType = c.getContentType();
+        if (contentType != null && contentType.toLowerCase(Locale.ROOT).contains("json")) {
+            throw new Exception("openrouter tts returned json: " + shortStr(readStr(c.getInputStream())));
+        }
+
+        float sampleRate = 24000.0f;
+        int channels = 1;
+        if (contentType != null) {
+            java.util.regex.Matcher rm = java.util.regex.Pattern
+                    .compile("(?i)(?:rate|sample_rate)\\s*=\\s*(\\d+(?:\\.\\d+)?)").matcher(contentType);
+            if (rm.find()) {
+                try {
+                    float parsed = Float.parseFloat(rm.group(1));
+                    if (parsed > 0f) sampleRate = parsed;
+                } catch (NumberFormatException ignored) {}
+            }
+            java.util.regex.Matcher cm = java.util.regex.Pattern
+                    .compile("(?i)channels\\s*=\\s*(\\d+)").matcher(contentType);
+            if (cm.find()) {
+                try {
+                    int parsed = Integer.parseInt(cm.group(1));
+                    if (parsed >= 1 && parsed <= 2) channels = parsed;
+                } catch (NumberFormatException ignored) {}
+            }
+        }
+        st.format = new AudioFormat(sampleRate, 16, channels, true, false);
+
+        try (InputStream in = c.getInputStream()) {
+            byte[] buf = new byte[4096];
+            int n;
+            while (!st.closed && !speechCancelled && (n = in.read(buf)) >= 0) {
+                if (n == 0) continue;
+                st.hasAudio = true;
+                st.queue.offer(Arrays.copyOf(buf, n));
+                if (!st.ready) st.signalReady();
+            }
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    void produceGoogleTtsStream(String text, TtsStream st) throws Exception {
+        String withVoice = "{\"contents\":[{\"parts\":[{\"text\":" + js(text) + "}]}],"
+                         + "\"generationConfig\":{\"responseModalities\":[\"AUDIO\"],"
+                         + "\"speechConfig\":{\"voiceConfig\":{\"prebuiltVoiceConfig\":{\"voiceName\":\"Charon\"}}}}}";
+        String plain = "{\"contents\":[{\"parts\":[{\"text\":" + js(text) + "}]}],"
+                     + "\"generationConfig\":{\"responseModalities\":[\"AUDIO\"]}}";
+        String url = GOOGLE_BASE + "/models/" + enc(GEMINI_TTS)
+                   + ":streamGenerateContent?alt=sse&key=" + enc(googleKey);
+        String body = withVoice;
+        for (int attempt = 0; attempt < 2; attempt++) {
+            HttpURLConnection c = (HttpURLConnection) URI.create(url).toURL().openConnection();
+            st.conn = c;
+            c.setRequestMethod("POST");
+            c.setDoOutput(true);
+            c.setConnectTimeout(20000);
+            c.setReadTimeout(60000);
+            c.setRequestProperty("Content-Type", "application/json");
+            c.setRequestProperty("Accept", "text/event-stream");
+            try (OutputStream o = c.getOutputStream()) {
+                o.write(body.getBytes(StandardCharsets.UTF_8));
+            }
+            int code = c.getResponseCode();
+            if (code == 400 && attempt == 0) {
+                try { readStr(c.getErrorStream()); } catch (Throwable ignored) {}
+                body = plain;
+                continue;
+            }
+            if (code == 404) {
+                try { readStr(c.getErrorStream()); } catch (Throwable ignored) {}
+                break; // fall through to non-streaming generateContent
+            }
+            if (code >= 400) {
+                throw new ApiException("google", code, readStr(c.getErrorStream()));
+            }
+            boolean parsedFirstFormat = false;
+            try (BufferedReader br = new BufferedReader(
+                    new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8))) {
+                String line;
+                while (!st.closed && !speechCancelled && (line = br.readLine()) != null) {
+                    if (line.isEmpty() || line.startsWith(":")) continue;
+                    if (!line.startsWith("data:")) continue;
+                    String data = line.substring(5).trim();
+                    if (data.isEmpty() || "[DONE]".equals(data)) continue;
+                    try {
+                        Object parts = dig(jparse(data), "candidates", 0, "content", "parts");
+                        if (!(parts instanceof List)) continue;
+                        for (Object po : (List<?>) parts) {
+                            if (!(po instanceof Map)) continue;
+                            Map<String, Object> pm = (Map<String, Object>) po;
+                            Object inl = pm.get("inlineData");
+                            if (inl == null) inl = pm.get("inline_data");
+                            if (!(inl instanceof Map)) continue;
+                            Map<String, Object> im = (Map<String, Object>) inl;
+                            Object dataObj = im.get("data");
+                            if (dataObj == null) continue;
+                            String b64 = dataObj.toString().replaceAll("\\s+", "");
+                            if (b64.isEmpty()) continue;
+                            byte[] raw = Base64.getDecoder().decode(b64);
+                            if (raw.length == 0) continue;
+                            if (!parsedFirstFormat) {
+                                parsedFirstFormat = true;
+                                if (raw.length >= 44 && raw[0] == 'R' && raw[1] == 'I'
+                                        && raw[2] == 'F' && raw[3] == 'F') {
+                                    byte[] stripped = stripWavToPcm(raw, st);
+                                    raw = stripped;
+                                } else {
+                                    int rate = 24000;
+                                    Object mt = im.get("mimeType");
+                                    if (mt == null) mt = im.get("mime_type");
+                                    if (mt != null) {
+                                        java.util.regex.Matcher rm = java.util.regex.Pattern
+                                                .compile("(?i)rate=(\\d+)").matcher(mt.toString());
+                                        if (rm.find()) {
+                                            try { rate = Integer.parseInt(rm.group(1)); } catch (NumberFormatException ignored) {}
+                                        }
+                                    }
+                                    st.format = new AudioFormat(AudioFormat.Encoding.PCM_SIGNED,
+                                            (float) rate, 16, 1, 2, (float) rate, false);
+                                }
+                            }
+                            if (raw.length > 0) {
+                                st.hasAudio = true;
+                                st.queue.offer(raw);
+                                if (!st.ready) st.signalReady();
+                            }
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            }
+            if (st.hasAudio) return;
+            break;
+        }
+        // Fallback to non-streaming generateContent if SSE endpoint returned 404 or empty audio
+        if (!st.closed && !speechCancelled) {
+            byte[] wav = synthesizeGoogle(text);
+            byte[] pcm = stripWavToPcm(wav, st);
+            if (pcm.length > 0) {
+                st.hasAudio = true;
+                st.queue.offer(pcm);
+                if (!st.ready) st.signalReady();
+            }
+        }
+    }
+
+    private static byte[] stripWavToPcm(byte[] w, TtsStream st) {
+        if (w.length < 44 || w[0] != 'R' || w[1] != 'I' || w[2] != 'F' || w[3] != 'F') return w;
+        int fmtTag = 1, ch = 1, bits = 16; long rate = 24000; int dataStart = -1; long dataLen = 0;
+        int off = 12;
+        while (off + 8 <= w.length) {
+            String id = new String(w, off, 4, StandardCharsets.US_ASCII);
+            long size = le32(w, off + 4);
+            if ("fmt ".equals(id) && off + 8 + 16 <= w.length) {
+                fmtTag = le16(w, off + 8);
+                ch     = le16(w, off + 10);
+                rate   = le32(w, off + 12);
+                bits   = le16(w, off + 22);
+                if (fmtTag == 0xFFFE && size >= 26 && off + 8 + 26 <= w.length) fmtTag = le16(w, off + 32);
+            } else if ("data".equals(id)) {
+                dataStart = off + 8;
+                long avail = w.length - dataStart;
+                dataLen = (size == 0 || size > avail) ? avail : size;
+                break;
+            }
+            off += 8 + (int) Math.min(size, Integer.MAX_VALUE - 16) + (int) (size & 1);
+        }
+        if (dataStart < 0 || dataLen <= 0 || ch < 1 || ch > 2) return new byte[0];
+        if (fmtTag == 3 && bits == 32) {
+            byte[] slice = Arrays.copyOfRange(w, dataStart, dataStart + (int) dataLen);
+            st.format = new AudioFormat(AudioFormat.Encoding.PCM_SIGNED, (float) rate, 16, ch, ch * 2, (float) rate, false);
+            return float32ToPcm16(slice, slice.length);
+        }
+        int frame = ch * (bits / 8);
+        st.format = new AudioFormat(bits == 8 ? AudioFormat.Encoding.PCM_UNSIGNED : AudioFormat.Encoding.PCM_SIGNED,
+                (float) rate, bits, ch, frame, (float) rate, false);
+        return Arrays.copyOfRange(w, dataStart, dataStart + (int) dataLen);
     }
 
     @SuppressWarnings("unchecked")

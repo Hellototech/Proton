@@ -44,15 +44,8 @@ public class main {
      *  Keys are entered on first launch and stored locally in
      *  ~/.proton-ai.properties. Nothing is baked into the source.
      * ============================================================ */
-    enum Provider { NVIDIA_GROQ, GROQ }
-
-    static volatile Provider provider = Provider.GROQ;
-    static volatile String groqKey = "";
-    static volatile String nvidiaKey = "";
-
-    static final String NVIDIA_BASE = "https://integrate.api.nvidia.com/v1";
-    static final String NVIDIA_MODEL = "nvidia/nemotron-3.5-super-vl-120b-a12b";
-    static final String NVIDIA_FALLBACK = "nvidia/nemotron-3-super-120b-a12b";
+    static volatile String googleKey = "";
+    static volatile String openrouterKey = "";
 
     /** How long the chrome-less splash stays on screen (spec: 8-10 s). */
     static final int SPLASH_MS = 9000;
@@ -83,17 +76,19 @@ public class main {
         });
     }
 
+    static String cleanKey(String k) {
+        if (k == null) return "";
+        String t = k.trim();
+        return t.startsWith("PASTE") ? "" : t;
+    }
+
     static void loadSavedConfig() {
-        String p = Prefs.getString("provider", "");
-        groqKey = Prefs.getString("groqKey", "");
-        nvidiaKey = Prefs.getString("nvidiaKey", "");
-        if (p.isEmpty()) p = nvidiaKey.isEmpty() ? "groq" : "nvidia+groq";
-        provider = ("nvidia+groq".equals(p) && !nvidiaKey.isEmpty())
-                ? Provider.NVIDIA_GROQ : Provider.GROQ;
+        googleKey = cleanKey(Prefs.getString("googleKey", ""));
+        openrouterKey = cleanKey(Prefs.getString("openrouterKey", ""));
     }
 
     static boolean hasSavedConfig() {
-        return !groqKey.isEmpty() && !groqKey.startsWith("PASTE");
+        return !googleKey.isEmpty() || !openrouterKey.isEmpty();
     }
 
     static void launchMain() {
@@ -574,46 +569,76 @@ final class Fnt {
 }
 
 /* =============================================================== */
-/*  FIRST-RUN SETUP -- provider choice + API keys                  */
+/*  FIRST-RUN SETUP -- independent free-tier BYOK setup            */
 /* =============================================================== */
 
 @SuppressWarnings("serial")
 class SetupWindow extends JFrame {
 
-    private final CardLayout cards = new CardLayout();
-    private final JPanel deck = new JPanel(cards);
-    private final JTextField nvidiaField = keyField();
-    private final JTextField groqField = keyField();
-    private final JPanel nvidiaBlock = new JPanel();
-    private final JLabel keysTitle = new JLabel();
+    private static final String GOOGLE_KEY_URL     = "https://aistudio.google.com/apikey";
+    private static final String OPENROUTER_KEY_URL = "https://openrouter.ai/keys";
+
+    private final KeyCard googleCard;
+    private final KeyCard openrouterCard;
     private final JLabel error = new JLabel(" ");
+    private final SetupButton launchBtn;
     private final boolean changing;
-    private boolean nvidiaMode = false;
 
     SetupWindow(boolean changing) {
         super("PROTON AI");
         this.changing = changing;
         setUndecorated(true);
-        setDefaultCloseOperation(EXIT_ON_CLOSE);
+        setDefaultCloseOperation(changing ? DISPOSE_ON_CLOSE : EXIT_ON_CLOSE);
         setBackground(Theme.BG);
-        setSize(600, 486);
+        setSize(620, 540);
         setResizable(false);
         setLocationRelativeTo(null);
         if (changing) setAlwaysOnTop(true);
 
-        nvidiaField.setText(Prefs.getString("nvidiaKey", ""));
-        groqField.setText(Prefs.getString("groqKey", ""));
+        googleCard = new KeyCard(
+                "Google AI Studio (Optional)",
+                "Gemini 3.8 Flash \u00B7 Voice STT \u00B7 Vision",
+                "AIza...",
+                "Get free key at aistudio.google.com \u2192",
+                GOOGLE_KEY_URL,
+                Prefs.getString("googleKey", ""),
+                this::testGoogleKey);
 
-        deck.setOpaque(false);
-        deck.add(buildProviderCard(), "provider");
-        deck.add(buildKeysCard(), "keys");
+        openrouterCard = new KeyCard(
+                "OpenRouter (Optional)",
+                "Nemotron 3.5 Super VL \u00B7 Fish Audio TTS",
+                "sk-or-...",
+                "Get free key at openrouter.ai/keys \u2192",
+                OPENROUTER_KEY_URL,
+                Prefs.getString("openrouterKey", ""),
+                this::testOpenRouterKey);
+
+        launchBtn = new SetupButton(changing ? "Save & Restart" : "Launch PROTON", true);
+        launchBtn.addActionListener(e -> submit());
 
         JPanel root = new SetupPanel();
-        root.setLayout(new BorderLayout());
-        root.add(deck, BorderLayout.CENTER);
+        root.setLayout(new GridBagLayout());
+        root.add(buildContent());
         setContentPane(root);
 
-        cards.show(deck, "provider");
+        javax.swing.event.DocumentListener dl = new javax.swing.event.DocumentListener() {
+            public void insertUpdate(javax.swing.event.DocumentEvent e) { syncValidity(true); }
+            public void removeUpdate(javax.swing.event.DocumentEvent e) { syncValidity(true); }
+            public void changedUpdate(javax.swing.event.DocumentEvent e) { syncValidity(true); }
+        };
+        googleCard.field.getDocument().addDocumentListener(dl);
+        openrouterCard.field.getDocument().addDocumentListener(dl);
+
+        KeyListener enterKey = new KeyAdapter() {
+            @Override public void keyPressed(KeyEvent e) {
+                if (e.getKeyCode() == KeyEvent.VK_ENTER) submit();
+            }
+        };
+        googleCard.field.addKeyListener(enterKey);
+        openrouterCard.field.addKeyListener(enterKey);
+
+        syncValidity(false);
+
         getRootPane().registerKeyboardAction(e -> {
             dispose();
             if (!changing) System.exit(0);
@@ -621,167 +646,121 @@ class SetupWindow extends JFrame {
                 JComponent.WHEN_IN_FOCUSED_WINDOW);
     }
 
-    /* ---------- screens ---------- */
-
-    private JPanel buildProviderCard() {
-        JPanel card = new JPanel(new GridBagLayout());
-        card.setOpaque(false);
+    private JPanel buildContent() {
         JPanel box = new JPanel();
         box.setOpaque(false);
         box.setLayout(new BoxLayout(box, BoxLayout.Y_AXIS));
+        box.setPreferredSize(new Dimension(520, 464));
+        box.setMaximumSize(new Dimension(520, 464));
 
-        JLabel kicker = label("SETUP", Font.BOLD, 9.5f, Theme.TEXT3);
-        kicker.setAlignmentX(Component.CENTER_ALIGNMENT);
-        JLabel title = label("Choose your AI engine", Font.BOLD, 24f, Theme.TEXT);
-        title.setAlignmentX(Component.CENTER_ALIGNMENT);
-        JLabel sub = label("Nemotron for complex work. Groq for everyday chat,", Font.PLAIN, 12f, Theme.TEXT2);
-        sub.setAlignmentX(Component.CENTER_ALIGNMENT);
-        JLabel sub2 = label("voice and hearing.", Font.PLAIN, 12f, Theme.TEXT2);
-        sub2.setAlignmentX(Component.CENTER_ALIGNMENT);
-
-        SetupButton nvidia = new SetupButton("NVIDIA NIM + Groq",
-                "Nemotron for complex work, coding, vision and agents. Groq for chat and voice.");
-        nvidia.addActionListener(e -> showKeys(true));
-        SetupButton groq = new SetupButton("Groq only",
-                "Fast chat and voice with Groq. No NVIDIA key needed.");
-        groq.addActionListener(e -> showKeys(false));
-
-        box.add(kicker);
-        box.add(Box.createVerticalStrut(10));
-        box.add(title);
-        box.add(Box.createVerticalStrut(8));
-        box.add(sub);
-        box.add(sub2);
-        box.add(Box.createVerticalStrut(30));
-        box.add(nvidia);
-        box.add(Box.createVerticalStrut(14));
-        box.add(groq);
-        box.add(Box.createVerticalStrut(18));
-        JLabel note = label("You can change this later from Settings.", Font.PLAIN, 10.5f, Theme.TEXT3);
-        note.setAlignmentX(Component.CENTER_ALIGNMENT);
-        box.add(note);
-
-        card.add(box);
-        return card;
-    }
-
-    private JPanel buildKeysCard() {
-        JPanel card = new JPanel(new GridBagLayout());
-        card.setOpaque(false);
-        JPanel box = new JPanel();
-        box.setOpaque(false);
-        box.setLayout(new BoxLayout(box, BoxLayout.Y_AXIS));
-
-        keysTitle.setFont(Fnt.get(Font.BOLD, 22f));
-        keysTitle.setForeground(Theme.TEXT);
-        keysTitle.setAlignmentX(Component.LEFT_ALIGNMENT);
-        JLabel sub = label("Keys are stored locally in ~/.proton-ai.properties.", Font.PLAIN, 11f, Theme.TEXT2);
+        JLabel kicker = label("FREE BYOK SETUP", Font.BOLD, 9.5f, new Color(0x8D95C9));
+        kicker.setAlignmentX(Component.LEFT_ALIGNMENT);
+        JLabel title = label("Connect your AI keys", Font.BOLD, 22f, Theme.TEXT);
+        title.setAlignmentX(Component.LEFT_ALIGNMENT);
+        JLabel sub = label("Add one or both free API keys \u2014 stored locally in ~/.proton-ai.properties.",
+                Font.PLAIN, 11.5f, Theme.TEXT2);
         sub.setAlignmentX(Component.LEFT_ALIGNMENT);
-
-        nvidiaBlock.setOpaque(false);
-        nvidiaBlock.setLayout(new BoxLayout(nvidiaBlock, BoxLayout.Y_AXIS));
-        nvidiaBlock.setAlignmentX(Component.LEFT_ALIGNMENT);
-        JLabel nl = label("NVIDIA NIM API key", Font.BOLD, 11.5f, Theme.TEXT);
-        nl.setAlignmentX(Component.LEFT_ALIGNMENT);
-        JLabel nh = label("Starts with nvapi-  \u00B7  used for Nemotron", Font.PLAIN, 10f, Theme.TEXT3);
-        nh.setAlignmentX(Component.LEFT_ALIGNMENT);
-        nvidiaField.setAlignmentX(Component.LEFT_ALIGNMENT);
-        nvidiaBlock.add(nl);
-        nvidiaBlock.add(Box.createVerticalStrut(6));
-        nvidiaBlock.add(nvidiaField);
-        nvidiaBlock.add(Box.createVerticalStrut(4));
-        nvidiaBlock.add(nh);
-        nvidiaBlock.add(Box.createVerticalStrut(16));
-
-        JLabel gl = label("Groq API key", Font.BOLD, 11.5f, Theme.TEXT);
-        gl.setAlignmentX(Component.LEFT_ALIGNMENT);
-        JLabel gh = label("Starts with gsk_  \u00B7  used for chat, TTS and STT", Font.PLAIN, 10f, Theme.TEXT3);
-        gh.setAlignmentX(Component.LEFT_ALIGNMENT);
-        groqField.setAlignmentX(Component.LEFT_ALIGNMENT);
 
         error.setFont(Fnt.get(Font.PLAIN, 10.5f));
         error.setForeground(new Color(0xFF7A9A));
         error.setAlignmentX(Component.LEFT_ALIGNMENT);
 
-        SetupButton back = new SetupButton("< Back", null, false);
-        back.addActionListener(e -> { error.setText(" "); cards.show(deck, "provider"); });
-        SetupButton done = new SetupButton(changing ? "Save & restart" : "Done", null, true);
-        done.addActionListener(e -> submit());
+        JPanel actions = new JPanel(new BorderLayout());
+        actions.setOpaque(false);
+        actions.setAlignmentX(Component.LEFT_ALIGNMENT);
+        actions.setMaximumSize(new Dimension(520, 42));
+        if (changing) {
+            SetupButton cancel = new SetupButton("Cancel", false);
+            cancel.addActionListener(e -> dispose());
+            actions.add(cancel, BorderLayout.WEST);
+        }
+        actions.add(launchBtn, BorderLayout.EAST);
 
-        JPanel row = new JPanel(new BorderLayout());
-        row.setOpaque(false);
-        row.setAlignmentX(Component.LEFT_ALIGNMENT);
-        row.setMaximumSize(new Dimension(492, 42));
-        row.add(back, BorderLayout.WEST);
-        row.add(done, BorderLayout.EAST);
-
-        box.add(keysTitle);
-        box.add(Box.createVerticalStrut(6));
-        box.add(sub);
-        box.add(Box.createVerticalStrut(22));
-        box.add(nvidiaBlock);
-        box.add(gl);
-        box.add(Box.createVerticalStrut(6));
-        box.add(groqField);
+        box.add(kicker);
         box.add(Box.createVerticalStrut(4));
-        box.add(gh);
-        box.add(Box.createVerticalStrut(8));
+        box.add(title);
+        box.add(Box.createVerticalStrut(4));
+        box.add(sub);
+        box.add(Box.createVerticalStrut(16));
+        box.add(googleCard);
+        box.add(Box.createVerticalStrut(12));
+        box.add(openrouterCard);
+        box.add(Box.createVerticalStrut(10));
         box.add(error);
-        box.add(Box.createVerticalStrut(14));
-        box.add(row);
-
-        card.add(box);
-        return card;
+        box.add(Box.createVerticalStrut(8));
+        box.add(actions);
+        return box;
     }
 
-    private void showKeys(boolean nvidia) {
-        nvidiaMode = nvidia;
-        nvidiaBlock.setVisible(nvidia);
-        keysTitle.setText(nvidia ? "Connect NVIDIA NIM + Groq" : "Connect Groq");
-        error.setText(" ");
-        cards.show(deck, "keys");
-        revalidate();
-        repaint();
-        (nvidia ? nvidiaField : groqField).requestFocusInWindow();
+    private void syncValidity(boolean showEmptyErr) {
+        String g = googleCard.getKey();
+        String o = openrouterCard.getKey();
+        boolean hasAny = !g.isEmpty() || !o.isEmpty();
+        launchBtn.setEnabled(hasAny);
+        if (hasAny) {
+            error.setText(" ");
+        } else if (showEmptyErr) {
+            error.setText("Add at least one free API key (Google or OpenRouter) to continue.");
+        }
+        launchBtn.repaint();
     }
 
     private void submit() {
-        String g = groqField.getText() == null ? "" : groqField.getText().trim();
-        String n = nvidiaField.getText() == null ? "" : nvidiaField.getText().trim();
-        if (g.isEmpty()) {
-            error.setText("Paste your Groq API key to continue.");
+        String g = main.cleanKey(googleCard.getKey());
+        String o = main.cleanKey(openrouterCard.getKey());
+        if (g.isEmpty() && o.isEmpty()) {
+            error.setText("Add at least one free API key (Google or OpenRouter) to continue.");
+            launchBtn.setEnabled(false);
             return;
         }
-        if (nvidiaMode && n.isEmpty()) {
-            error.setText("Paste your NVIDIA NIM API key to continue.");
-            return;
-        }
-        Prefs.setString("provider", nvidiaMode ? "nvidia+groq" : "groq");
-        Prefs.setString("groqKey", g);
-        if (!n.isEmpty()) Prefs.setString("nvidiaKey", n);
-        main.provider = nvidiaMode ? main.Provider.NVIDIA_GROQ : main.Provider.GROQ;
-        main.groqKey = g;
-        main.nvidiaKey = nvidiaMode ? n : "";
+        Prefs.setString("googleKey", g.isEmpty() ? null : g);
+        Prefs.setString("openrouterKey", o.isEmpty() ? null : o);
+        main.googleKey = g;
+        main.openrouterKey = o;
         dispose();
         if (changing) main.restartApp();
         else main.launchMain();
     }
 
-    /* ---------- small helpers ---------- */
+    private String[] testGoogleKey(String key) {
+        try {
+            String url = Brain.GOOGLE_BASE + "/models?key=" + URLEncoder.encode(key, "UTF-8");
+            HttpURLConnection c = (HttpURLConnection) URI.create(url).toURL().openConnection();
+            c.setRequestMethod("GET");
+            c.setConnectTimeout(10000);
+            c.setReadTimeout(10000);
+            int code = c.getResponseCode();
+            if (code == 200) {
+                try (InputStream in = c.getInputStream()) { Brain.readStr(in); }
+                return new String[]{"ok", "\u2713 Valid"};
+            }
+            String err = "";
+            try (InputStream in = c.getErrorStream()) { err = Brain.readStr(in); } catch (Throwable ignored) {}
+            return new String[]{"err", "Invalid (" + code + ")" + (err.isEmpty() ? "" : "")};
+        } catch (Throwable t) {
+            return new String[]{"err", "Connection failed"};
+        }
+    }
 
-    private static JTextField keyField() {
-        JTextField f = new JTextField();
-        f.setOpaque(true);
-        f.setBackground(new Color(0x141222));
-        f.setForeground(Theme.TEXT);
-        f.setCaretColor(Theme.TEXT);
-        f.setFont(Fnt.get(Font.PLAIN, 13f));
-        f.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createLineBorder(new Color(255, 255, 255, 34), 1, true),
-                new EmptyBorder(11, 13, 11, 13)));
-        f.setMaximumSize(new Dimension(492, 46));
-        f.setPreferredSize(new Dimension(492, 46));
-        return f;
+    private String[] testOpenRouterKey(String key) {
+        try {
+            HttpURLConnection c = (HttpURLConnection)
+                    URI.create(Brain.OPENROUTER_BASE + "/auth/key").toURL().openConnection();
+            c.setRequestMethod("GET");
+            c.setRequestProperty("Authorization", "Bearer " + key);
+            c.setRequestProperty("HTTP-Referer", Brain.OR_REFERER);
+            c.setRequestProperty("X-Title", Brain.OR_TITLE);
+            c.setConnectTimeout(10000);
+            c.setReadTimeout(10000);
+            int code = c.getResponseCode();
+            if (code == 200) {
+                try (InputStream in = c.getInputStream()) { Brain.readStr(in); }
+                return new String[]{"ok", "\u2713 Valid"};
+            }
+            return new String[]{"err", "Invalid (" + code + ")"};
+        } catch (Throwable t) {
+            return new String[]{"err", "Connection failed"};
+        }
     }
 
     private static JLabel label(String text, int style, float size, Color color) {
@@ -791,36 +770,245 @@ class SetupWindow extends JFrame {
         return l;
     }
 
-    /** Glassy card button used by both setup screens. */
-    @SuppressWarnings("serial")
-    static final class SetupButton extends JButton {
-        private final String title;
-        private final String subtitle;
-        private final boolean primary;
+    private static void openUrl(String url) {
+        try {
+            if (Desktop.isDesktopSupported()) Desktop.getDesktop().browse(URI.create(url));
+        } catch (Throwable ignored) {}
+    }
 
-        SetupButton(String title, String subtitle) {
-            this(title, subtitle, false);
+    /** Provider card with capability badge, masked key field, eye toggle, Test button, and link. */
+    @SuppressWarnings("serial")
+    private static final class KeyCard extends JPanel {
+        final KeyPasswordField field;
+        private final JLabel status = new JLabel(" ");
+        private final SmallButton testBtn = new SmallButton("Test");
+        private final EyeButton eyeBtn;
+
+        KeyCard(String title, String badge, String placeholder, String linkText,
+                String url, String initial, java.util.function.Function<String, String[]> tester) {
+            setOpaque(false);
+            setAlignmentX(Component.LEFT_ALIGNMENT);
+            setMaximumSize(new Dimension(520, 128));
+            setPreferredSize(new Dimension(520, 128));
+            setLayout(new BoxLayout(this, BoxLayout.Y_AXIS));
+            setBorder(new EmptyBorder(13, 16, 11, 16));
+
+            JPanel top = new JPanel(new BorderLayout(8, 0));
+            top.setOpaque(false);
+            top.setAlignmentX(Component.LEFT_ALIGNMENT);
+            top.setMaximumSize(new Dimension(488, 22));
+            JLabel tl = label(title, Font.BOLD, 12.5f, Theme.TEXT);
+            BadgeLabel bl = new BadgeLabel(badge);
+            top.add(tl, BorderLayout.WEST);
+            top.add(bl, BorderLayout.EAST);
+
+            field = new KeyPasswordField(placeholder);
+            field.setText(initial == null ? "" : initial);
+            eyeBtn = new EyeButton(field);
+
+            JPanel fieldWrap = new JPanel(new BorderLayout(0, 0));
+            fieldWrap.setOpaque(true);
+            fieldWrap.setBackground(new Color(0x141222));
+            fieldWrap.setBorder(BorderFactory.createLineBorder(new Color(255, 255, 255, 34), 1, true));
+            fieldWrap.add(field, BorderLayout.CENTER);
+            fieldWrap.add(eyeBtn, BorderLayout.EAST);
+
+            JPanel inputRow = new JPanel(new BorderLayout(8, 0));
+            inputRow.setOpaque(false);
+            inputRow.setAlignmentX(Component.LEFT_ALIGNMENT);
+            inputRow.setMaximumSize(new Dimension(488, 38));
+            inputRow.setPreferredSize(new Dimension(488, 38));
+            inputRow.add(fieldWrap, BorderLayout.CENTER);
+            inputRow.add(testBtn, BorderLayout.EAST);
+
+            JPanel foot = new JPanel(new BorderLayout(8, 0));
+            foot.setOpaque(false);
+            foot.setAlignmentX(Component.LEFT_ALIGNMENT);
+            foot.setMaximumSize(new Dimension(488, 18));
+            JLabel link = label(linkText, Font.PLAIN, 10.5f, Theme.TEXT3);
+            link.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            link.addMouseListener(new MouseAdapter() {
+                @Override public void mouseEntered(MouseEvent e) { link.setForeground(new Color(0xB8C2FF)); }
+                @Override public void mouseExited(MouseEvent e) { link.setForeground(Theme.TEXT3); }
+                @Override public void mouseClicked(MouseEvent e) { openUrl(url); }
+            });
+            status.setFont(Fnt.get(Font.BOLD, 10.5f));
+            status.setHorizontalAlignment(SwingConstants.RIGHT);
+            foot.add(link, BorderLayout.WEST);
+            foot.add(status, BorderLayout.EAST);
+
+            testBtn.addActionListener(e -> {
+                String k = getKey();
+                if (k.isEmpty()) {
+                    status.setForeground(new Color(0xFF7A9A));
+                    status.setText("Enter key first");
+                    return;
+                }
+                testBtn.setEnabled(false);
+                status.setForeground(Theme.TEXT2);
+                status.setText("Testing\u2026");
+                Thread th = new Thread(() -> {
+                    String[] res = tester.apply(k);
+                    SwingUtilities.invokeLater(() -> {
+                        testBtn.setEnabled(true);
+                        boolean ok = "ok".equals(res[0]);
+                        status.setForeground(ok ? new Color(0x3DDC97) : new Color(0xFF7A9A));
+                        status.setText(res[1]);
+                    });
+                }, "proton-key-test");
+                th.setDaemon(true);
+                th.start();
+            });
+
+            add(top);
+            add(Box.createVerticalStrut(9));
+            add(inputRow);
+            add(Box.createVerticalStrut(8));
+            add(foot);
         }
 
-        SetupButton(String title, String subtitle, boolean primary) {
-            this.title = title;
-            this.subtitle = subtitle;
-            this.primary = primary;
-            setText("");
+        String getKey() {
+            char[] pw = field.getPassword();
+            return pw == null ? "" : new String(pw).trim();
+        }
+
+        @Override
+        protected void paintComponent(Graphics g) {
+            Graphics2D g2 = (Graphics2D) g.create();
+            try {
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                int w = getWidth(), h = getHeight();
+                RoundRectangle2D rr = new RoundRectangle2D.Float(0.5f, 0.5f, w - 1f, h - 1f, 16, 16);
+                g2.setColor(new Color(255, 255, 255, 9));
+                g2.fill(rr);
+                g2.setPaint(new GradientPaint(0, 0, new Color(255, 255, 255, 10),
+                        0, h, new Color(255, 255, 255, 2)));
+                g2.fill(rr);
+                g2.setColor(new Color(255, 255, 255, 28));
+                g2.setStroke(new BasicStroke(1f));
+                g2.draw(rr);
+            } finally {
+                g2.dispose();
+            }
+            super.paintComponent(g);
+        }
+    }
+
+    @SuppressWarnings("serial")
+    private static final class BadgeLabel extends JLabel {
+        BadgeLabel(String text) {
+            super(text);
+            setFont(Fnt.get(Font.PLAIN, 9.5f));
+            setForeground(new Color(0xC6CBFF));
+            setBorder(new EmptyBorder(2, 9, 2, 9));
+        }
+
+        @Override
+        protected void paintComponent(Graphics g) {
+            Graphics2D g2 = (Graphics2D) g.create();
+            try {
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                int w = getWidth(), h = getHeight();
+                RoundRectangle2D rr = new RoundRectangle2D.Float(0.5f, 0.5f, w - 1f, h - 1f, h, h);
+                g2.setColor(new Color(109, 107, 255, 34));
+                g2.fill(rr);
+                g2.setColor(new Color(168, 140, 255, 65));
+                g2.setStroke(new BasicStroke(1f));
+                g2.draw(rr);
+            } finally {
+                g2.dispose();
+            }
+            super.paintComponent(g);
+        }
+    }
+
+    @SuppressWarnings("serial")
+    private static final class KeyPasswordField extends JPasswordField {
+        private final String placeholder;
+        KeyPasswordField(String placeholder) {
+            this.placeholder = placeholder;
+            setOpaque(false);
+            setEchoChar('\u2022');
+            setForeground(Theme.TEXT);
+            setCaretColor(Theme.TEXT);
+            setFont(Fnt.get(Font.PLAIN, 12.5f));
+            setBorder(new EmptyBorder(8, 12, 8, 6));
+        }
+
+        @Override
+        protected void paintComponent(Graphics g) {
+            super.paintComponent(g);
+            if (getPassword().length == 0) {
+                Graphics2D g2 = (Graphics2D) g.create();
+                try {
+                    g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+                    g2.setFont(getFont());
+                    g2.setColor(Theme.TEXT3);
+                    FontMetrics fm = g2.getFontMetrics();
+                    int y = (getHeight() + fm.getAscent() - fm.getDescent()) / 2;
+                    g2.drawString(placeholder, 12, y);
+                } finally {
+                    g2.dispose();
+                }
+            }
+        }
+    }
+
+    @SuppressWarnings("serial")
+    private static final class EyeButton extends JButton {
+        private boolean shown = false;
+        EyeButton(KeyPasswordField target) {
             setContentAreaFilled(false);
             setBorderPainted(false);
             setFocusPainted(false);
             setOpaque(false);
             setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
-            setAlignmentX(Component.CENTER_ALIGNMENT);
-            if (subtitle != null) {
-                setPreferredSize(new Dimension(492, 84));
-                setMaximumSize(new Dimension(492, 84));
-            } else {
-                setPreferredSize(new Dimension(primary ? 132 : 96, 40));
-                setMaximumSize(new Dimension(primary ? 132 : 96, 40));
+            setPreferredSize(new Dimension(36, 36));
+            setToolTipText("Show/Hide key");
+            addActionListener(e -> {
+                shown = !shown;
+                target.setEchoChar(shown ? (char) 0 : '\u2022');
+                repaint();
+            });
+        }
+
+        @Override
+        protected void paintComponent(Graphics g) {
+            Graphics2D g2 = (Graphics2D) g.create();
+            try {
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                int w = getWidth(), h = getHeight();
+                float cx = w / 2f, cy = h / 2f;
+                boolean hover = getModel().isRollover();
+                g2.setColor(shown ? new Color(0xC6CBFF) : (hover ? Theme.TEXT : Theme.TEXT2));
+                g2.setStroke(new BasicStroke(1.4f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                Path2D eye = new Path2D.Float();
+                eye.moveTo(cx - 7.5f, cy);
+                eye.quadTo(cx, cy - 5.5f, cx + 7.5f, cy);
+                eye.quadTo(cx, cy + 5.5f, cx - 7.5f, cy);
+                g2.draw(eye);
+                g2.fill(new Ellipse2D.Float(cx - 2.2f, cy - 2.2f, 4.4f, 4.4f));
+                if (!shown) {
+                    g2.draw(new Line2D.Float(cx - 6.5f, cy + 5.5f, cx + 6.5f, cy - 5.5f));
+                }
+            } finally {
+                g2.dispose();
             }
-            getAccessibleContext().setAccessibleName(title);
+        }
+    }
+
+    @SuppressWarnings("serial")
+    private static final class SmallButton extends JButton {
+        SmallButton(String text) {
+            super(text);
+            setContentAreaFilled(false);
+            setBorderPainted(false);
+            setFocusPainted(false);
+            setOpaque(false);
+            setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            setPreferredSize(new Dimension(62, 38));
+            setMinimumSize(new Dimension(62, 38));
+            setMaximumSize(new Dimension(62, 38));
         }
 
         @Override
@@ -830,23 +1018,76 @@ class SetupWindow extends JFrame {
                 g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
                 g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
                 int w = getWidth(), h = getHeight();
-                boolean hover = getModel().isRollover();
-                boolean press = getModel().isPressed();
-                int arc = subtitle != null ? 18 : h;
-                RoundRectangle2D rr = new RoundRectangle2D.Float(0.5f, 0.5f, w - 1, h - 1, arc, arc);
+                boolean hover = isEnabled() && getModel().isRollover();
+                RoundRectangle2D rr = new RoundRectangle2D.Float(0.5f, 0.5f, w - 1f, h - 1f, 10, 10);
+                g2.setColor(new Color(255, 255, 255, hover ? 22 : 12));
+                g2.fill(rr);
+                g2.setColor(new Color(255, 255, 255, hover ? 56 : 32));
+                g2.setStroke(new BasicStroke(1f));
+                g2.draw(rr);
+                g2.setFont(Fnt.get(Font.BOLD, 11.5f));
+                g2.setColor(isEnabled() ? Theme.TEXT : Theme.TEXT3);
+                FontMetrics fm = g2.getFontMetrics();
+                String t = getText();
+                g2.drawString(t, (w - fm.stringWidth(t)) / 2,
+                        (h + fm.getAscent() - fm.getDescent()) / 2);
+            } finally {
+                g2.dispose();
+            }
+        }
+    }
 
-                if (primary) {
+    /** Primary / secondary pill button. */
+    @SuppressWarnings("serial")
+    static final class SetupButton extends JButton {
+        private final String title;
+        private final boolean primary;
+
+        SetupButton(String title, boolean primary) {
+            this.title = title;
+            this.primary = primary;
+            setText("");
+            setContentAreaFilled(false);
+            setBorderPainted(false);
+            setFocusPainted(false);
+            setOpaque(false);
+            setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            int w = primary ? 160 : 96;
+            setPreferredSize(new Dimension(w, 40));
+            setMaximumSize(new Dimension(w, 40));
+            getAccessibleContext().setAccessibleName(title);
+        }
+
+        @Override
+        public void setEnabled(boolean b) {
+            super.setEnabled(b);
+            setCursor(Cursor.getPredefinedCursor(b ? Cursor.HAND_CURSOR : Cursor.DEFAULT_CURSOR));
+        }
+
+        @Override
+        protected void paintComponent(Graphics g) {
+            Graphics2D g2 = (Graphics2D) g.create();
+            try {
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+                int w = getWidth(), h = getHeight();
+                boolean en = isEnabled();
+                boolean hover = en && getModel().isRollover();
+                boolean press = en && getModel().isPressed();
+                RoundRectangle2D rr = new RoundRectangle2D.Float(0.5f, 0.5f, w - 1f, h - 1f, h, h);
+
+                if (primary && en) {
                     g2.setPaint(new LinearGradientPaint(
                             new Point2D.Float(0, 0), new Point2D.Float(w, h),
-                            new float[]{0f, 0.55f, 1f},
-                            new Color[]{new Color(0x2B6BFF), new Color(0xA855F7), new Color(0xFF4DD0)}));
+                            new float[]{0f, 0.5f, 1f},
+                            new Color[]{new Color(0x3D7BFF), new Color(0xA855F7), new Color(0xFF4DD0)}));
                     g2.fill(rr);
-                    g2.setColor(new Color(255, 255, 255, 40));
+                    g2.setColor(new Color(255, 255, 255, hover ? 72 : 42));
                     g2.draw(rr);
                 } else {
                     g2.setColor(new Color(255, 255, 255, hover ? 20 : 10));
                     g2.fill(rr);
-                    g2.setColor(new Color(255, 255, 255, hover ? 46 : 26));
+                    g2.setColor(new Color(255, 255, 255, hover ? 46 : 24));
                     g2.setStroke(new BasicStroke(1f));
                     g2.draw(rr);
                 }
@@ -854,40 +1095,36 @@ class SetupWindow extends JFrame {
                     g2.setColor(new Color(0, 0, 0, 40));
                     g2.fill(rr);
                 }
-
-                if (subtitle != null) {
-                    g2.setFont(Fnt.get(Font.BOLD, 14f));
-                    g2.setColor(Theme.TEXT);
-                    g2.drawString(title, 22, 33);
-                    g2.setFont(Fnt.get(Font.PLAIN, 11f));
-                    g2.setColor(Theme.TEXT2);
-                    String s = subtitle;
-                    FontMetrics fm = g2.getFontMetrics();
-                    if (fm.stringWidth(s) > w - 44) {
-                        while (s.length() > 4 && fm.stringWidth(s + "...") > w - 44) s = s.substring(0, s.length() - 1);
-                        s += "...";
-                    }
-                    g2.drawString(s, 22, 55);
-                } else {
-                    g2.setFont(Fnt.get(Font.BOLD, 12.5f));
-                    g2.setColor(Color.WHITE);
-                    FontMetrics fm = g2.getFontMetrics();
-                    int tx = (w - fm.stringWidth(title)) / 2;
-                    int ty = (h + fm.getAscent() - fm.getDescent()) / 2;
-                    g2.drawString(title, tx, ty);
-                }
+                g2.setFont(Fnt.get(Font.BOLD, 12.5f));
+                g2.setColor(en ? Color.WHITE : Theme.TEXT3);
+                FontMetrics fm = g2.getFontMetrics();
+                int tx = (w - fm.stringWidth(title)) / 2;
+                int ty = (h + fm.getAscent() - fm.getDescent()) / 2;
+                g2.drawString(title, tx, ty);
             } finally {
                 g2.dispose();
             }
         }
     }
 
-    /** Paints the aurora backdrop and the glass card behind the deck. */
+    /** Paints the aurora backdrop, liquid-glass card, and supports window dragging. */
     @SuppressWarnings("serial")
     private final class SetupPanel extends JPanel {
+        private Point dragStart;
         SetupPanel() {
             setOpaque(true);
             setBackground(Theme.BG);
+            MouseAdapter dragger = new MouseAdapter() {
+                @Override public void mousePressed(MouseEvent e) { dragStart = e.getPoint(); }
+                @Override public void mouseDragged(MouseEvent e) {
+                    if (dragStart == null) return;
+                    Point p = SetupWindow.this.getLocation();
+                    SetupWindow.this.setLocation(p.x + e.getX() - dragStart.x,
+                                                 p.y + e.getY() - dragStart.y);
+                }
+            };
+            addMouseListener(dragger);
+            addMouseMotionListener(dragger);
         }
 
         @Override
@@ -898,23 +1135,22 @@ class SetupWindow extends JFrame {
                 g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
                 g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
                 int w = getWidth(), h = getHeight();
-                g2.setPaint(new GradientPaint(0, 0, new Color(0x0B0920), 0, h, new Color(0x04030A)));
+                g2.setPaint(new GradientPaint(0, 0, new Color(0x0B0920), 0, h, Theme.BG));
                 g2.fillRect(0, 0, w, h);
 
                 g2.setPaint(new RadialGradientPaint(
-                        new Point2D.Float(w * 0.22f, h * 0.18f), 280f,
+                        new Point2D.Float(w * 0.20f, h * 0.16f), 290f,
                         new float[]{0f, 1f},
-                        new Color[]{Theme.alpha(new Color(0x3D3BFF), 0.18),
-                                    new Color(0, 0, 0, 0)}));
-                g2.fill(new Ellipse2D.Float(w * 0.22f - 280f, h * 0.18f - 280f, 560f, 560f));
-                g2.setPaint(new RadialGradientPaint(
-                        new Point2D.Float(w * 0.82f, h * 0.86f), 260f,
-                        new float[]{0f, 1f},
-                        new Color[]{Theme.alpha(new Color(0xFF2FA8), 0.12),
-                                    new Color(0, 0, 0, 0)}));
-                g2.fill(new Ellipse2D.Float(w * 0.82f - 260f, h * 0.86f - 260f, 520f, 520f));
+                        new Color[]{Theme.alpha(new Color(0x3D7BFF), 0.20), new Color(0, 0, 0, 0)}));
+                g2.fill(new Ellipse2D.Float(w * 0.20f - 290f, h * 0.16f - 290f, 580f, 580f));
 
-                RoundRectangle2D card = new RoundRectangle2D.Float(26.5f, 26.5f, w - 53f, h - 53f, 28, 28);
+                g2.setPaint(new RadialGradientPaint(
+                        new Point2D.Float(w * 0.84f, h * 0.86f), 270f,
+                        new float[]{0f, 1f},
+                        new Color[]{Theme.alpha(new Color(0xFF4DD0), 0.14), new Color(0, 0, 0, 0)}));
+                g2.fill(new Ellipse2D.Float(w * 0.84f - 270f, h * 0.86f - 270f, 540f, 540f));
+
+                RoundRectangle2D card = new RoundRectangle2D.Float(22.5f, 22.5f, w - 45f, h - 45f, 26, 26);
                 g2.setColor(new Color(10, 8, 20, 236));
                 g2.fill(card);
                 g2.setPaint(new GradientPaint(0, 0, new Color(255, 255, 255, 18),
@@ -1264,8 +1500,7 @@ class TitleBar extends JPanel {
 class ProtonFrame extends JFrame {
 
     final S s = new S();
-    final Brain brain = new Brain(main.groqKey, main.nvidiaKey,
-            main.provider == main.Provider.NVIDIA_GROQ);
+    final Brain brain = new Brain(main.googleKey, main.openrouterKey);
     volatile boolean siriActive = false; // Siri wake overlay owns audio + visuals
     {
         // Background skills (monitors) speak up through here: pop-up always, voice only when Proton is idle.
@@ -2131,6 +2366,12 @@ class ProtonFrame extends JFrame {
         s.speaking = false;
         if (s.thinking) setThinking(false);
 
+        if (!brain.hasGoogle()) {
+            s.transcript = "\u201C add a free Google key in Settings for voice input \u201D";
+            s.transcriptTtl = 6f;
+            return;
+        }
+
         s.micActive = true;
         s.micLive = false;
         s.micHeard = false;
@@ -2226,6 +2467,15 @@ class ProtonFrame extends JFrame {
                 return;
             }
             try {
+                if (!brain.hasGoogle()) {
+                    SwingUtilities.invokeLater(() -> {
+                        if (gen != queryGen) return;
+                        setThinking(false);
+                        s.transcript = "\u201C add a free Google key in Settings for voice input \u201D";
+                        s.transcriptTtl = 6f;
+                    });
+                    return;
+                }
                 SwingUtilities.invokeLater(() -> { if (gen == queryGen) setThinking(true); });
                 String text = brain.transcribe(pcm);
                 if (gen != queryGen) return;
@@ -3104,7 +3354,7 @@ class WakeListener extends Thread {
         double noise = 0.006, loudMs = 0, quietMs = 0, segMs = 0;
         while (alive) {
             try {
-                if (!brain.hasKey() || !cb.canListen()) {
+                if (!brain.hasGoogle() || !cb.canListen()) {
                     if (line != null) closeLine();
                     inSpeech = false; loudMs = 0; quietMs = 0; segMs = 0;
                     pre.clear(); seg.reset();
@@ -3364,6 +3614,15 @@ class SettingsPanel extends JComponent {
     void setWake(boolean on) { wakeOn = on; repaint(); }
     void setNoise(int lvl) { noiseLevel = lvl; repaint(); }
 
+    private static String activeProvidersLabel() {
+        boolean g = !main.googleKey.isEmpty();
+        boolean o = !main.openrouterKey.isEmpty();
+        if (g && o) return "Google + OpenRouter";
+        if (g) return "Google only";
+        if (o) return "OpenRouter only";
+        return "No API keys configured";
+    }
+
     /** Wraps a status message into at most maxLines lines that fit maxWidth. */
     private static String[] wrap(Graphics2D g2, String text, int maxWidth, int maxLines) {
         List<String> lines = new ArrayList<>();
@@ -3486,7 +3745,7 @@ class SettingsPanel extends JComponent {
         g2.drawString("API keys", 20, 278);
         g2.setFont(Fnt.get(Font.PLAIN, 10.5f));
         g2.setColor(Theme.TEXT3);
-        g2.drawString("Change provider or keys", 20, 293);
+        g2.drawString(activeProvidersLabel(), 20, 293);
 
         int pw = 74, ph = 24, px = w - 20 - pw, py = 264;
         RoundRectangle2D pill = new RoundRectangle2D.Float(px, py, pw, ph, ph, ph);
@@ -5178,6 +5437,14 @@ final class SiriOverlay {
             try { wav = src.stopAndGetAudio(); } catch (Throwable ignored) {}
             try { src.stopCapture(); } catch (Throwable ignored) {}
             String text = null;
+            if (!brain.hasGoogle()) {
+                SwingUtilities.invokeLater(() -> {
+                    if (!active || dismissing || g != turn) return;
+                    processing = false;
+                    status = "Add a free Google key in Settings";
+                });
+                return;
+            }
             if (wav != null && wav.length > 6000) {
                 try { text = brain.transcribe(wav); } catch (Throwable ignored) {}
             }
@@ -7901,21 +8168,43 @@ final class MemoryToast {
 
 class Brain {
 
-    static final String BASE       = "https://api.groq.com/openai/v1";
-    static final String CHAT_MODEL = "openai/gpt-oss-120b";
-    static final String STT_MODEL  = "whisper-large-v3-turbo";
-    static final String VISION_MODEL = "qwen/qwen3.8-27b";
-    static final String TTS_MODEL  = "canopylabs/orpheus-v1-english";
-    static final String TTS_VOICE  = "troy";   // male voice
-    static final int    TTS_MAX_CHARS = 190;   // Orpheus accepts <= 200 chars per request
+    static final String GOOGLE_BASE     = "https://generativelanguage.googleapis.com/v1beta";
+    static final String GEMINI_PRO      = "gemini-3.8-flash";
+    static final String GEMINI_FAST     = "gemini-3.5-flash-lite";
+    static final String GEMINI_STT      = "gemini-3.5-transcribe";
+    static final String GEMINI_TTS      = "gemini-3.8-flash-lite-tts";
+
+    static final String OPENROUTER_BASE = "https://openrouter.ai/api/v1";
+    static final String OR_MODEL        = "nvidia/nemotron-3.5-super-vl:free";
+    static final String OR_TTS_MODEL    = "fish-audio/s2.1-pro-free:free";
+    static final String OR_REFERER      = "https://tryprotonai.pages.dev";
+    static final String OR_TITLE        = "PROTON AI";
+
+    static final class Target {
+        final boolean google;
+        final String model;
+        Target(boolean google, String model) { this.google = google; this.model = model; }
+        @Override public String toString() { return (google ? "google:" : "openrouter:") + model; }
+    }
+
+    static final class ApiException extends Exception {
+        private static final long serialVersionUID = 1L;
+        final String provider;
+        final int status;
+        ApiException(String provider, int status, String body) {
+            super(provider + " " + status + ": " + shortStr(body));
+            this.provider = provider;
+            this.status = status;
+        }
+        boolean isRetryable() { return status == 429 || status == 502 || status == 503; }
+    }
 
     static class ChatMsg { final String role, content; ChatMsg(String r, String c) { role = r; content = c; } }
     static class Step { String action = ""; String target = ""; long waitMs = 0; }
     static class Plan { String speech = ""; List<Step> steps = new ArrayList<>(); }
 
-    final String key;          // Groq key (chat fallback, STT, TTS, vision fallback)
-    final String nvidiaKey;    // NVIDIA NIM key (may be empty)
-    final boolean nvidia;      // true when NVIDIA + Groq was chosen
+    final String googleKey;
+    final String openrouterKey;
     final List<ChatMsg> history = new ArrayList<>();
     static final int HISTORY_MAX = 20;
     final Object planLock = new Object();
@@ -7969,19 +8258,11 @@ class Brain {
         return fgCacheTitle;
     }
 
-    String ttsModel, ttsVoice;
-    boolean ttsDisabled, ttsLogged;
-
     // speech playback control (barge-in)
     volatile boolean speechCancelled = false;
     volatile Clip activeClip;
     volatile SourceDataLine activeLine;
     volatile Process speechProc;
-
-    List<String> visionCands;
-    Set<String> visionDead = new LinkedHashSet<>();
-    volatile boolean nvidiaVisionDead = false;
-    String visionPicked;
 
     /* ---- Corner Mini-Orb Companion HUD hooks (wired by ProtonFrame) ---- */
     interface CompanionHooks {
@@ -8092,108 +8373,255 @@ class Brain {
         }
     }
 
-    Brain(String gk, String nk, boolean nv) {
-        this.key = (gk == null) ? "" : gk.trim();
-        this.nvidiaKey = (nk == null) ? "" : nk.trim();
-        this.nvidia = nv && !this.nvidiaKey.isEmpty();
+    Brain(String gk, String ork) {
+        this.googleKey = main.cleanKey(gk);
+        this.openrouterKey = main.cleanKey(ork);
         warmUp(); startSkillRuntime();
     }
-    boolean hasKey() { return !key.isEmpty() && !key.startsWith("PASTE"); }
-    boolean hasNvidia() { return nvidia; }
+    boolean hasGoogle() { return !googleKey.isEmpty(); }
+    boolean hasOpenRouter() { return !openrouterKey.isEmpty(); }
+    boolean hasKey() { return hasGoogle() || hasOpenRouter(); }
     void log(String m) { System.out.println("[proton] " + m); }
 
     /* ============================================================
-     * NVIDIA NIM (OpenAI-compatible) -- Nemotron reasoning engine
+     * OPENROUTER (OpenAI-compatible) + GOOGLE AI STUDIO (Gemini)
      * ============================================================ */
 
-    HttpURLConnection nconn(String path) throws Exception {
+    HttpURLConnection orConn(String path, int readTimeoutMs) throws Exception {
         HttpURLConnection c = (HttpURLConnection)
-                URI.create(main.NVIDIA_BASE + path).toURL().openConnection();
-        c.setRequestProperty("Authorization", "Bearer " + nvidiaKey);
+                URI.create(OPENROUTER_BASE + path).toURL().openConnection();
+        c.setRequestProperty("Authorization", "Bearer " + openrouterKey);
+        c.setRequestProperty("HTTP-Referer", OR_REFERER);
+        c.setRequestProperty("X-Title", OR_TITLE);
         c.setConnectTimeout(20000);
-        c.setReadTimeout(180000);
+        c.setReadTimeout(readTimeoutMs);
         return c;
     }
 
-    String nvidiaPost(String path, String json) throws Exception {
-        HttpURLConnection c = nconn(path);
+    String orPostJson(String path, String json, int readTimeoutMs) throws Exception {
+        HttpURLConnection c = orConn(path, readTimeoutMs);
         c.setRequestMethod("POST");
         c.setDoOutput(true);
         c.setRequestProperty("Content-Type", "application/json");
         c.setRequestProperty("Accept", "application/json");
-        OutputStream o = c.getOutputStream();
-        try { o.write(json.getBytes(StandardCharsets.UTF_8)); } finally { o.close(); }
+        try (OutputStream o = c.getOutputStream()) {
+            o.write(json.getBytes(StandardCharsets.UTF_8));
+        }
         int code = c.getResponseCode();
         InputStream in = (code >= 400) ? c.getErrorStream() : c.getInputStream();
         String body = readStr(in);
-        if (code >= 400) throw new Exception("nvidia " + code + ": " + shortStr(body));
+        if (code >= 400) throw new ApiException("openrouter", code, body);
         return body;
     }
 
-    static boolean isModelMissing(Throwable t) {
-        String m = String.valueOf(t == null ? "" : t.getMessage()).toLowerCase(Locale.ROOT);
-        return m.contains("404") || m.contains("model_not_found") || m.contains("does not exist")
-                || m.contains("not found") || m.contains("unknown model");
-    }
-
-    /** Non-streaming Nemotron call with automatic fallback to the smaller model. */
-    String nvidiaComplete(String model, String msgsJson, int maxTokens, double temp) throws Exception {
-        String use = model;
-        for (int attempt = 0; attempt < 2; attempt++) {
-            String body = "{\"model\":" + js(use) + ",\"messages\":[" + msgsJson + "],"
-                        + "\"max_tokens\":" + maxTokens + ",\"temperature\":" + temp + "}";
-            try {
-                return nvidiaPost("/chat/completions", body);
-            } catch (Exception ex) {
-                if (attempt == 0 && !main.NVIDIA_FALLBACK.equals(use) && isModelMissing(ex)) {
-                    log("nvidia model " + use + " unavailable, trying " + main.NVIDIA_FALLBACK);
-                    use = main.NVIDIA_FALLBACK;
-                    continue;
-                }
-                throw ex;
-            }
+    byte[] orPostBytes(String path, String json, int readTimeoutMs) throws Exception {
+        HttpURLConnection c = orConn(path, readTimeoutMs);
+        c.setRequestMethod("POST");
+        c.setDoOutput(true);
+        c.setRequestProperty("Content-Type", "application/json");
+        try (OutputStream o = c.getOutputStream()) {
+            o.write(json.getBytes(StandardCharsets.UTF_8));
         }
-        throw new Exception("nvidia call failed");
+        int code = c.getResponseCode();
+        if (code >= 400) {
+            throw new ApiException("openrouter", code, readStr(c.getErrorStream()));
+        }
+        return readBytes(c.getInputStream());
     }
 
-    /** Streaming Nemotron call: reasoning deltas go to the thought window, content is returned. */
-    String nvidiaStream(String model, String msgsJson, int maxTokens, double temp) throws Exception {
-        ThoughtHooks hooks = thoughtHooks;
+    String orComplete(String model, String msgsJson, int maxTokens, double temp) throws Exception {
+        String body = "{\"model\":" + js(model) + ",\"messages\":[" + msgsJson + "],"
+                    + "\"max_tokens\":" + maxTokens + ",\"temperature\":" + temp + "}";
+        String res = orPostJson("/chat/completions", body, 120000);
+        Object content = dig(jparse(res), "choices", 0, "message", "content");
+        if (content == null || content.toString().trim().isEmpty())
+            throw new Exception("openrouter returned empty content");
+        return content.toString();
+    }
+
+    String orStream(String model, String msgsJson, int maxTokens, double temp,
+                    boolean showThoughts) throws Exception {
+        ThoughtHooks hooks = showThoughts ? thoughtHooks : null;
         if (hooks != null) try { hooks.begin(); } catch (Throwable ignored) {}
         try {
-            String use = model;
-            for (int attempt = 0; attempt < 2; attempt++) {
-                try {
-                    return nvidiaStreamOnce(use, msgsJson, maxTokens, temp, hooks);
-                } catch (Exception ex) {
-                    if (attempt == 0 && !main.NVIDIA_FALLBACK.equals(use) && isModelMissing(ex)) {
-                        log("nvidia stream model " + use + " unavailable, trying " + main.NVIDIA_FALLBACK);
-                        use = main.NVIDIA_FALLBACK;
-                        continue;
-                    }
-                    throw ex;
+            HttpURLConnection c = orConn("/chat/completions", 180000);
+            c.setRequestMethod("POST");
+            c.setDoOutput(true);
+            c.setRequestProperty("Content-Type", "application/json");
+            c.setRequestProperty("Accept", "text/event-stream");
+            String body = "{\"model\":" + js(model) + ",\"messages\":[" + msgsJson + "],"
+                        + "\"stream\":true,\"max_tokens\":" + maxTokens + ",\"temperature\":" + temp + "}";
+            try (OutputStream o = c.getOutputStream()) {
+                o.write(body.getBytes(StandardCharsets.UTF_8));
+            }
+            int code = c.getResponseCode();
+            if (code >= 400) {
+                throw new ApiException("openrouter", code, readStr(c.getErrorStream()));
+            }
+            StringBuilder answer = new StringBuilder();
+            try (BufferedReader br = new BufferedReader(
+                    new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = br.readLine()) != null) {
+                    if (line.isEmpty() || line.startsWith(":")) continue;
+                    if (!line.startsWith("data:")) continue;
+                    String data = line.substring(5).trim();
+                    if ("[DONE]".equals(data)) break;
+                    try {
+                        Object root = jparse(data);
+                        Object r = dig(root, "choices", 0, "delta", "reasoning_content");
+                        if (r == null) r = dig(root, "choices", 0, "delta", "reasoning");
+                        if (r != null && !r.toString().isEmpty() && hooks != null) {
+                            try { hooks.thought(r.toString()); } catch (Throwable ignored) {}
+                        }
+                        Object ct = dig(root, "choices", 0, "delta", "content");
+                        if (ct != null) answer.append(ct.toString());
+                    } catch (Throwable ignored) {}
                 }
             }
-            throw new Exception("nvidia stream failed");
+            return answer.toString();
         } finally {
             if (hooks != null) try { hooks.end(); } catch (Throwable ignored) {}
         }
     }
 
-    private String nvidiaStreamOnce(String model, String msgsJson, int maxTokens, double temp,
-                                    ThoughtHooks hooks) throws Exception {
-        HttpURLConnection c = nconn("/chat/completions");
+    String googlePostRaw(String model, String method, String jsonBody, int readTimeoutMs) throws Exception {
+        String url = GOOGLE_BASE + "/models/" + enc(model) + ":" + method + "?key=" + enc(googleKey);
+        HttpURLConnection c = (HttpURLConnection) URI.create(url).toURL().openConnection();
         c.setRequestMethod("POST");
         c.setDoOutput(true);
+        c.setConnectTimeout(20000);
+        c.setReadTimeout(readTimeoutMs);
+        c.setRequestProperty("Content-Type", "application/json");
+        c.setRequestProperty("Accept", "application/json");
+        try (OutputStream o = c.getOutputStream()) {
+            o.write(jsonBody.getBytes(StandardCharsets.UTF_8));
+        }
+        int code = c.getResponseCode();
+        InputStream in = (code >= 400) ? c.getErrorStream() : c.getInputStream();
+        String body = readStr(in);
+        if (code >= 400) throw new ApiException("google", code, body);
+        return body;
+    }
+
+    @SuppressWarnings("unchecked")
+    static String toGeminiBody(String msgsJson, int maxTokens, double temp,
+                               boolean includeThoughts, String toolsJson) {
+        StringBuilder sys = new StringBuilder();
+        List<String> roles = new ArrayList<>();
+        List<StringBuilder> parts = new ArrayList<>();
+        try {
+            Object parsed = jparse("[" + msgsJson + "]");
+            if (parsed instanceof List) {
+                for (Object item : (List<?>) parsed) {
+                    if (!(item instanceof Map)) continue;
+                    Map<String, Object> m = (Map<String, Object>) item;
+                    String role = m.get("role") == null ? "user" : m.get("role").toString();
+                    Object co = m.get("content");
+                    String content = co == null ? "" : co.toString();
+                    if ("system".equals(role)) {
+                        if (!content.isEmpty()) {
+                            if (sys.length() > 0) sys.append("\n\n");
+                            sys.append(content);
+                        }
+                        continue;
+                    }
+                    String gRole = "assistant".equals(role) ? "model" : "user";
+                    if (!roles.isEmpty() && roles.get(roles.size() - 1).equals(gRole)) {
+                        parts.get(parts.size() - 1).append(",{\"text\":").append(js(content)).append("}");
+                    } else {
+                        roles.add(gRole);
+                        parts.add(new StringBuilder("{\"text\":").append(js(content)).append("}"));
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+        if (roles.isEmpty()) {
+            roles.add("user");
+            parts.add(new StringBuilder("{\"text\":\" \"}"));
+        }
+        StringBuilder out = new StringBuilder("{");
+        if (sys.length() > 0) {
+            out.append("\"systemInstruction\":{\"parts\":[{\"text\":").append(js(sys.toString())).append("}]},");
+        }
+        out.append("\"contents\":[");
+        for (int i = 0; i < roles.size(); i++) {
+            if (i > 0) out.append(',');
+            out.append("{\"role\":").append(js(roles.get(i))).append(",\"parts\":[").append(parts.get(i)).append("]}");
+        }
+        out.append("],\"generationConfig\":{\"temperature\":").append(temp)
+           .append(",\"maxOutputTokens\":").append(maxTokens);
+        if (includeThoughts) {
+            out.append(",\"thinkingConfig\":{\"includeThoughts\":true}");
+        }
+        out.append("}");
+        if (toolsJson != null && !toolsJson.isEmpty()) {
+            out.append(",\"tools\":").append(toolsJson);
+        }
+        out.append("}");
+        return out.toString();
+    }
+
+    static String extractGeminiText(String body) {
+        if (body == null || body.trim().isEmpty()) return "";
+        Object root = jparse(body);
+        Object parts = dig(root, "candidates", 0, "content", "parts");
+        if (!(parts instanceof List)) return "";
+        StringBuilder out = new StringBuilder();
+        for (Object po : (List<?>) parts) {
+            if (!(po instanceof Map)) continue;
+            Map<?, ?> pm = (Map<?, ?>) po;
+            if (Boolean.TRUE.equals(pm.get("thought"))) continue;
+            Object t = pm.get("text");
+            if (t != null) out.append(t.toString());
+        }
+        return out.toString();
+    }
+
+    String googleComplete(String model, String msgsJson, int maxTokens, double temp) throws Exception {
+        String body = toGeminiBody(msgsJson, maxTokens, temp, false, null);
+        String res = googlePostRaw(model, "generateContent", body, 120000);
+        String txt = extractGeminiText(res);
+        if (txt.trim().isEmpty()) throw new Exception("google returned empty content");
+        return txt;
+    }
+
+    String googleStream(String model, String msgsJson, int maxTokens, double temp,
+                        boolean showThoughts) throws Exception {
+        ThoughtHooks hooks = showThoughts ? thoughtHooks : null;
+        if (hooks != null) try { hooks.begin(); } catch (Throwable ignored) {}
+        try {
+            try {
+                return googleStreamOnce(model, msgsJson, maxTokens, temp, showThoughts, hooks);
+            } catch (ApiException ex) {
+                if (showThoughts && ex.status == 400) {
+                    return googleStreamOnce(model, msgsJson, maxTokens, temp, false, hooks);
+                }
+                throw ex;
+            }
+        } finally {
+            if (hooks != null) try { hooks.end(); } catch (Throwable ignored) {}
+        }
+    }
+
+    private String googleStreamOnce(String model, String msgsJson, int maxTokens, double temp,
+                                    boolean includeThoughts, ThoughtHooks hooks) throws Exception {
+        String url = GOOGLE_BASE + "/models/" + enc(model)
+                   + ":streamGenerateContent?alt=sse&key=" + enc(googleKey);
+        HttpURLConnection c = (HttpURLConnection) URI.create(url).toURL().openConnection();
+        c.setRequestMethod("POST");
+        c.setDoOutput(true);
+        c.setConnectTimeout(20000);
+        c.setReadTimeout(180000);
         c.setRequestProperty("Content-Type", "application/json");
         c.setRequestProperty("Accept", "text/event-stream");
-        String body = "{\"model\":" + js(model) + ",\"messages\":[" + msgsJson + "],"
-                    + "\"stream\":true,\"max_tokens\":" + maxTokens + ",\"temperature\":" + temp + "}";
-        OutputStream o = c.getOutputStream();
-        try { o.write(body.getBytes(StandardCharsets.UTF_8)); } finally { o.close(); }
+        String body = toGeminiBody(msgsJson, maxTokens, temp, includeThoughts, null);
+        try (OutputStream o = c.getOutputStream()) {
+            o.write(body.getBytes(StandardCharsets.UTF_8));
+        }
         int code = c.getResponseCode();
         if (code >= 400) {
-            throw new Exception("nvidia " + code + ": " + shortStr(readStr(c.getErrorStream())));
+            throw new ApiException("google", code, readStr(c.getErrorStream()));
         }
         StringBuilder answer = new StringBuilder();
         try (BufferedReader br = new BufferedReader(
@@ -8203,23 +8631,131 @@ class Brain {
                 if (line.isEmpty() || line.startsWith(":")) continue;
                 if (!line.startsWith("data:")) continue;
                 String data = line.substring(5).trim();
-                if ("[DONE]".equals(data)) break;
+                if (data.isEmpty() || "[DONE]".equals(data)) continue;
                 try {
                     Object root = jparse(data);
-                    Object r = dig(root, "choices", 0, "delta", "reasoning_content");
-                    if (r == null) r = dig(root, "choices", 0, "delta", "reasoning");
-                    if (r != null && !r.toString().isEmpty() && hooks != null) {
-                        try { hooks.thought(r.toString()); } catch (Throwable ignored) {}
+                    Object parts = dig(root, "candidates", 0, "content", "parts");
+                    if (parts instanceof List) {
+                        for (Object po : (List<?>) parts) {
+                            if (!(po instanceof Map)) continue;
+                            Map<?, ?> pm = (Map<?, ?>) po;
+                            Object t = pm.get("text");
+                            if (t == null || t.toString().isEmpty()) continue;
+                            if (Boolean.TRUE.equals(pm.get("thought"))) {
+                                if (hooks != null) {
+                                    try { hooks.thought(t.toString()); } catch (Throwable ignored) {}
+                                }
+                            } else {
+                                answer.append(t.toString());
+                            }
+                        }
                     }
-                    Object ct = dig(root, "choices", 0, "delta", "content");
-                    if (ct != null) answer.append(ct.toString());
                 } catch (Throwable ignored) {}
             }
         }
         return answer.toString();
     }
 
-    static final String NEMOTRON_PERSONA =
+    List<Target> fastTargets() {
+        List<Target> list = new ArrayList<>();
+        if (hasGoogle()) list.add(new Target(true, GEMINI_FAST));
+        if (hasOpenRouter()) list.add(new Target(false, OR_MODEL));
+        if (hasGoogle()) list.add(new Target(true, GEMINI_PRO));
+        return list;
+    }
+
+    List<Target> deepTargets() {
+        List<Target> list = new ArrayList<>();
+        if (hasOpenRouter()) list.add(new Target(false, OR_MODEL));
+        if (hasGoogle()) list.add(new Target(true, GEMINI_PRO));
+        if (hasGoogle()) list.add(new Target(true, GEMINI_FAST));
+        return list;
+    }
+
+    List<Target> visionCandidates() {
+        List<Target> list = new ArrayList<>();
+        if (hasGoogle()) list.add(new Target(true, GEMINI_PRO));
+        if (hasOpenRouter()) list.add(new Target(false, OR_MODEL));
+        if (hasGoogle()) list.add(new Target(true, GEMINI_FAST));
+        return list;
+    }
+
+    String completeFast(String msgsJson, int maxTokens, double temp) throws Exception {
+        List<Target> targets = fastTargets();
+        if (targets.isEmpty()) throw new Exception("No API key configured.");
+        Exception last = null;
+        for (int i = 0; i < targets.size(); i++) {
+            Target t = targets.get(i);
+            for (int retry = 0; retry < (targets.size() == 1 ? 2 : 1); retry++) {
+                try {
+                    return t.google
+                            ? googleComplete(t.model, msgsJson, maxTokens, temp)
+                            : orComplete(t.model, msgsJson, maxTokens, temp);
+                } catch (Exception ex) {
+                    last = ex;
+                    log("fast " + t + " failed: " + shortStr(String.valueOf(ex.getMessage())));
+                    if (targets.size() == 1 && retry == 0 && ex instanceof ApiException && ((ApiException) ex).isRetryable()) {
+                        try { Thread.sleep(700); } catch (InterruptedException ignored) {}
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        throw last != null ? last : new Exception("fast chat failed");
+    }
+
+    String completeDeep(String msgsJson, int maxTokens, double temp) throws Exception {
+        List<Target> targets = deepTargets();
+        if (targets.isEmpty()) throw new Exception("No API key configured.");
+        Exception last = null;
+        for (Target t : targets) {
+            for (int retry = 0; retry < (targets.size() == 1 ? 2 : 1); retry++) {
+                try {
+                    return t.google
+                            ? googleComplete(t.model, msgsJson, maxTokens, temp)
+                            : orComplete(t.model, msgsJson, maxTokens, temp);
+                } catch (Exception ex) {
+                    last = ex;
+                    log("deep " + t + " failed: " + shortStr(String.valueOf(ex.getMessage())));
+                    if (targets.size() == 1 && retry == 0 && ex instanceof ApiException && ((ApiException) ex).isRetryable()) {
+                        try { Thread.sleep(700); } catch (InterruptedException ignored) {}
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        throw last != null ? last : new Exception("deep completion failed");
+    }
+
+    String streamDeep(String msgsJson, int maxTokens, double temp) throws Exception {
+        List<Target> targets = deepTargets();
+        if (targets.isEmpty()) throw new Exception("No API key configured.");
+        Exception last = null;
+        for (Target t : targets) {
+            for (int retry = 0; retry < (targets.size() == 1 ? 2 : 1); retry++) {
+                try {
+                    String out = t.google
+                            ? googleStream(t.model, msgsJson, maxTokens, temp, !GEMINI_FAST.equals(t.model))
+                            : orStream(t.model, msgsJson, maxTokens, temp, true);
+                    if (out != null && !out.trim().isEmpty()) return out;
+                    throw new Exception(t + " returned empty stream");
+                } catch (Exception ex) {
+                    last = ex;
+                    log("stream " + t + " failed: " + shortStr(String.valueOf(ex.getMessage())));
+                    if (targets.size() == 1 && retry == 0 && ex instanceof ApiException && ((ApiException) ex).isRetryable()) {
+                        try { Thread.sleep(700); } catch (InterruptedException ignored) {}
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        throw last != null ? last : new Exception("deep stream failed");
+    }
+
+    static final String REASONING_PERSONA =
         "You are PROTON, a JARVIS-style AI companion living on the user's PC. Your reply is SPOKEN ALOUD.\n" +
         "don't use emoji and markdown say as a person says in normal except in coding you can use numbers emoji and special character as you want\n" +
         "you are an excellent agentic coder and especially built for agentic works\n" +
@@ -8235,9 +8771,9 @@ class Brain {
       + "step by step|agent|agentic|automate|automation|workflow|research|compare|trade-?offs?|pros and cons|"
       + "math|physics|essay|report|thesis|strategy|vision|screen|screenshot|look at|see my|read my)\\b");
 
-    /** True when the request deserves the full Nemotron reasoning model. */
+    /** True when the request deserves the full deep reasoning model. */
     boolean isComplexTask(String t) {
-        if (!nvidia || t == null) return false;
+        if (t == null) return false;
         String n = t.toLowerCase(Locale.ROOT).replaceAll("\\s+", " ").trim();
         if (n.length() < 3) return false;
         // "write a poem/script/email" is content creation, not a desktop action.
@@ -8388,19 +8924,7 @@ class Brain {
 
         try {
             String msgs = ideMessages(userText, editing);
-            String raw = null;
-            if (nvidia) {
-                try {
-                    raw = nvidiaStream(main.NVIDIA_MODEL, msgs, 9000, 0.25);
-                } catch (Throwable t) {
-                    log("ide nemotron failed, falling back to groq: " + shortStr(String.valueOf(t.getMessage())));
-                }
-            }
-            if (raw == null || raw.trim().isEmpty()) {
-                String body = postFast(msgs, "high", 7000, 0.25);
-                Object content = dig(jparse(body), "choices", 0, "message", "content");
-                if (content != null) raw = content.toString();
-            }
+            String raw = streamDeep(msgs, 9000, 0.25);
             if (raw == null || raw.trim().isEmpty())
                 return "I couldn't reach the coding model. Please try again.";
 
@@ -9254,25 +9778,44 @@ class Brain {
 
     /** STT tuned for the short wake phrase (English, biased towards "Hey Proton"). */
     String transcribeWake(byte[] wav) throws Exception {
-        Map<String, String> f = new LinkedHashMap<>();
-        f.put("model", STT_MODEL);
-        f.put("response_format", "json");
-        f.put("language", "en");
-        f.put("prompt", "Hey Proton.");
-        String body = postMultipart("/audio/transcriptions", wav, "audio.wav", f);
-        Object root = jparse(body);
-        Object text = dig(root, "text");
-        return text == null ? "" : text.toString();
+        if (!hasGoogle()) return "";
+        return googleTranscribeWithFallback(wav);
     }
 
     String transcribe(byte[] wav) throws Exception {
-        Map<String, String> f = new LinkedHashMap<>();
-        f.put("model", STT_MODEL);
-        f.put("response_format", "json");
-        String body = postMultipart("/audio/transcriptions", wav, "audio.wav", f);
-        Object root = jparse(body);
-        Object text = dig(root, "text");
-        return text == null ? "" : text.toString();
+        if (!hasGoogle()) {
+            throw new IllegalStateException("add a free Google key in Settings for voice input");
+        }
+        return googleTranscribeWithFallback(wav);
+    }
+
+    private String googleTranscribeWithFallback(byte[] wav) throws Exception {
+        String b64 = Base64.getEncoder().encodeToString(wav);
+        String prompt = "Transcribe this audio verbatim. Return only the spoken words.";
+        String json = "{\"contents\":[{\"parts\":[{\"text\":" + js(prompt) + "},"
+                    + "{\"inline_data\":{\"mime_type\":\"audio/wav\",\"data\":" + js(b64) + "}}]}],"
+                    + "\"generationConfig\":{\"temperature\":0.0,\"maxOutputTokens\":512}}";
+        String[] models = {GEMINI_STT, GEMINI_FAST};
+        Exception last = null;
+        for (int i = 0; i < models.length; i++) {
+            String m = models[i];
+            for (int retry = 0; retry < (i == models.length - 1 ? 2 : 1); retry++) {
+                try {
+                    String res = googlePostRaw(m, "generateContent", json, 60000);
+                    return extractGeminiText(res).trim();
+                } catch (Exception ex) {
+                    last = ex;
+                    log("stt " + m + " failed: " + shortStr(String.valueOf(ex.getMessage())));
+                    if (i == models.length - 1 && retry == 0 && ex instanceof ApiException
+                            && ((ApiException) ex).isRetryable()) {
+                        try { Thread.sleep(600); } catch (InterruptedException ignored) {}
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        throw last != null ? last : new Exception("speech transcription failed");
     }
 
     /** Immediately stops whatever the assistant is saying. */
@@ -9290,35 +9833,18 @@ class Brain {
         if (text == null || text.trim().isEmpty()) return;
         speechCancelled = false;
         boolean played = false;
-        if (!ttsDisabled) {
-            String[][] cands = {
-                {TTS_MODEL, TTS_VOICE},
-                {"playai-tts", "Fritz-PlayAI"},
-                {"playai-tts", "Arista-PlayAI"},
-                {"playai-tts", "Celeste-PlayAI"},
-                {"playai-tts", "Cheyenne-PlayAI"},
-                {"playai-tts", "Thunder-PlayAI"},
-            };
-            if (ttsModel != null) {
-                try { played = speakWith(text, ttsModel, ttsVoice); }
-                catch (Throwable t) { log("tts " + ttsModel + " failed: " + t); ttsModel = null; }
+        if (hasOpenRouter() && !speechCancelled) {
+            try {
+                played = speakWith(text, false);
+            } catch (Throwable t) {
+                log("openrouter tts failed: " + shortStr(String.valueOf(t.getMessage())));
             }
-            if (!played && !speechCancelled) {
-                for (String[] c : cands) {
-                    if (speechCancelled) break;
-                    try {
-                        if (speakWith(text, c[0], c[1])) {
-                            ttsModel = c[0]; ttsVoice = c[1];
-                            played = true;
-                            break;
-                        }
-                    } catch (Throwable t) { log("tts " + c[0] + "/" + c[1] + " failed: " + t); }
-                }
-            }
-            if (!played && !ttsLogged && !speechCancelled) {
-                ttsLogged = true;
-                ttsDisabled = true;
-                log("groq tts unavailable - using system voice");
+        }
+        if (!played && hasGoogle() && !speechCancelled) {
+            try {
+                played = speakWith(text, true);
+            } catch (Throwable t) {
+                log("google tts failed: " + shortStr(String.valueOf(t.getMessage())));
             }
         }
         if (!played && !speechCancelled) speakNative(text);
@@ -9370,14 +9896,13 @@ class Brain {
         return out;
     }
 
-    /** Synthesizes + plays with one model/voice. Long text is chunked; the next chunk is
+    /** Synthesizes + plays with one provider. Long text is chunked; the next chunk is
      *  fetched while the current one plays. Returns true once playback started/finished. */
-    boolean speakWith(String text, String model, String voice) throws Exception {
-        List<String> parts = model.contains("orpheus")
-                ? ttsChunks(text, TTS_MAX_CHARS) : java.util.Collections.singletonList(text);
+    boolean speakWith(String text, boolean useGoogle) throws Exception {
+        List<String> parts = ttsChunks(text, 450);
         if (parts.isEmpty()) return true;
-        if (parts.size() > 1 || parts.get(0).length() > 110) parts = shortFirst(parts);
-        java.util.concurrent.CompletableFuture<byte[]> next = fetchTts(parts.get(0), model, voice);
+        if (parts.size() > 1) parts = shortFirst(parts);
+        java.util.concurrent.CompletableFuture<byte[]> next = fetchTts(parts.get(0), useGoogle);
         boolean started = false;
         for (int i = 0; i < parts.size(); i++) {
             if (speechCancelled) return true;
@@ -9387,7 +9912,7 @@ class Brain {
                 if (!started) throw (t.getCause() instanceof Exception ? (Exception) t.getCause() : new Exception(t));
                 return true;
             }
-            next = (i + 1 < parts.size()) ? fetchTts(parts.get(i + 1), model, voice) : null;
+            next = (i + 1 < parts.size()) ? fetchTts(parts.get(i + 1), useGoogle) : null;
             playWav(wav);
             started = true;
             if (next == null) break;
@@ -9395,10 +9920,10 @@ class Brain {
         return true;
     }
 
-    private java.util.concurrent.CompletableFuture<byte[]> fetchTts(String t, String model, String voice) {
+    private java.util.concurrent.CompletableFuture<byte[]> fetchTts(String t, boolean useGoogle) {
         java.util.concurrent.CompletableFuture<byte[]> f = new java.util.concurrent.CompletableFuture<>();
         Thread th = new Thread(() -> {
-            try { f.complete(synthesize(t, model, voice)); }
+            try { f.complete(useGoogle ? synthesizeGoogle(t) : synthesizeOpenRouter(t)); }
             catch (Throwable ex) { f.completeExceptionally(ex); }
         }, "tts-fetch");
         th.setDaemon(true);
@@ -9496,39 +10021,27 @@ class Brain {
 
     /** Opens the TLS connection and primes the caches while the user is still looking at the window. */
     void warmUp() {
-        if (key.isEmpty()) return;
+        if (!hasKey()) return;
         Thread t = new Thread(() -> {
             try { fgCacheTime = 0L; getForegroundTitle(); openWindows(true); } catch (Throwable ignored) {}
-            try {
-                HttpURLConnection c = (HttpURLConnection) URI.create(BASE + "/models").toURL().openConnection();
-                c.setRequestProperty("Authorization", "Bearer " + key);
-                c.setConnectTimeout(5000); c.setReadTimeout(5000);
-                readStr(c.getInputStream());
-            } catch (Throwable ignored) {}
-            if (nvidia) {
+            if (hasGoogle()) {
                 try {
-                    HttpURLConnection c = nconn("/models");
+                    String u = GOOGLE_BASE + "/models?key=" + enc(googleKey);
+                    HttpURLConnection c = (HttpURLConnection) URI.create(u).toURL().openConnection();
                     c.setConnectTimeout(5000); c.setReadTimeout(5000);
+                    readStr(c.getInputStream());
+                } catch (Throwable ignored) {}
+            }
+            if (hasOpenRouter()) {
+                try {
+                    HttpURLConnection c = orConn("/auth/key", 5000);
+                    c.setConnectTimeout(5000);
                     readStr(c.getInputStream());
                 } catch (Throwable ignored) {}
             }
         }, "proton-warmup");
         t.setDaemon(true);
         t.start();
-    }
-
-    /** Fast structured call: low reasoning effort + token cap; falls back to a plain request if the API rejects the extras. */
-    String postFast(String msgsJson, String effort, int maxTokens, double temp) throws Exception {
-        String fast = "{\"model\":" + js(CHAT_MODEL) + ",\"messages\":[" + msgsJson + "],"
-                    + "\"reasoning_effort\":" + js(effort) + ",\"include_reasoning\":false,"
-                    + "\"max_tokens\":" + maxTokens + ",\"temperature\":" + temp + "}";
-        try { return postJson("/chat/completions", fast); }
-        catch (Exception ex) {
-            String m = String.valueOf(ex.getMessage());
-            if (m.contains("429") || m.contains("401") || m.contains("403")) throw ex;
-            log("fast call rejected (" + shortStr(m) + ") - retrying plain");
-            return postJson("/chat/completions", "{\"model\":" + js(CHAT_MODEL) + ",\"messages\":[" + msgsJson + "]}");
-        }
     }
 
     /* ============================================================
@@ -9579,20 +10092,9 @@ class Brain {
 
     /** One call to the thinking model. Overridable for tests. */
     String forgeCall(String msgsJson) throws Exception {
-        String body;
-        if (nvidia) {
-            try {
-                body = nvidiaComplete(main.NVIDIA_MODEL, msgsJson, 4500, 0.3);
-            } catch (Throwable t) {
-                log("nemotron forge failed, falling back to groq: " + shortStr(String.valueOf(t.getMessage())));
-                body = postFast(msgsJson, "high", 4500, 0.3);
-            }
-        } else {
-            body = postFast(msgsJson, "high", 4500, 0.3);
-        }
-        Object content = dig(jparse(body), "choices", 0, "message", "content");
-        if (content == null || content.toString().trim().isEmpty()) throw new Exception("the model returned nothing");
-        return content.toString();
+        String content = completeDeep(msgsJson, 4500, 0.3);
+        if (content == null || content.trim().isEmpty()) throw new Exception("the model returned nothing");
+        return cleanComplex(content);
     }
 
     String forgeMsgs(String request, String prevCode, String error, String output) {
@@ -9730,8 +10232,8 @@ class Brain {
                        + "say numbers naturally, no markdown, mention only what matters.";
             String msgs = "{\"role\":\"system\",\"content\":" + js(sys) + "},{\"role\":\"user\",\"content\":"
                         + js("Request: " + request + "\n\nOUTPUT:\n" + (out.length() > 6000 ? out.substring(0, 6000) : out)) + "}";
-            Object c = dig(jparse(postFast(msgs, "low", 350, 0.3)), "choices", 0, "message", "content");
-            if (c != null && !c.toString().trim().isEmpty()) return cleanSpoken(c.toString());
+            String c = completeFast(msgs, 350, 0.3);
+            if (c != null && !c.trim().isEmpty()) return cleanSpoken(c);
         } catch (Throwable t) { log("skill summary failed: " + shortStr(String.valueOf(t.getMessage()))); }
         return flat.substring(0, 300);
     }
@@ -10343,8 +10845,8 @@ class Brain {
 
     /** Thoughtful answer path for questions and conversation. Returns null when it is really a PC command. */
     String converse(String userText) throws Exception {
-        boolean useNvidia = nvidia && isComplexTask(userText);
-        String sys = (useNvidia ? NEMOTRON_PERSONA : PERSONA) + "\nCONTEXT\n- NOW: " + java.time.LocalDateTime.now().format(
+        boolean complex = isComplexTask(userText);
+        String sys = (complex ? REASONING_PERSONA : PERSONA) + "\nCONTEXT\n- NOW: " + java.time.LocalDateTime.now().format(
                 java.time.format.DateTimeFormatter.ofPattern("EEEE, d MMMM yyyy, h:mm a", Locale.ENGLISH)) + "\n"
                 + UserFacts.promptBlock();
         StringBuilder msgs = new StringBuilder();
@@ -10356,26 +10858,15 @@ class Brain {
             }
         }
         msgs.append(",{\"role\":\"user\",\"content\":").append(js(userText)).append("}");
+        String effort = effortFor(userText);
         String out;
-        if (useNvidia) {
-            String effort = effortFor(userText);
-            try {
-                out = cleanComplex(nvidiaStream(main.NVIDIA_MODEL, msgs.toString(),
-                        effort.equals("high") ? 4096 : 2600, 0.6));
-            } catch (Throwable t) {
-                log("nemotron failed, falling back to groq: " + shortStr(String.valueOf(t.getMessage())));
-                String body = postFast(msgs.toString(), effort, effort.equals("high") ? 2200 : 900,
-                        effort.equals("high") ? 0.4 : 0.6);
-                Object content = dig(jparse(body), "choices", 0, "message", "content");
-                if (content == null) return null;
-                out = cleanSpoken(content.toString());
-            }
+        if (complex) {
+            out = cleanComplex(streamDeep(msgs.toString(), effort.equals("high") ? 4096 : 2600, 0.6));
         } else {
-            String effort = effortFor(userText);
-            String body = postFast(msgs.toString(), effort, effort.equals("high") ? 2200 : 900, effort.equals("high") ? 0.4 : 0.6);
-            Object content = dig(jparse(body), "choices", 0, "message", "content");
-            if (content == null) return null;
-            out = cleanSpoken(content.toString());
+            String raw = completeFast(msgs.toString(), effort.equals("high") ? 2200 : 900,
+                    effort.equals("high") ? 0.4 : 0.6);
+            if (raw == null) return null;
+            out = cleanSpoken(raw);
         }
         if (out.contains("[[WEB]]")) return "[[WEB]]";
         if (out.isEmpty() || out.contains("[[ACTION]]")) return null;
@@ -10447,20 +10938,10 @@ class Brain {
         msgs.append(",{\"role\":\"user\",\"content\":").append(js(userText)).append("}");
         String content;
         int words = userText == null ? 0 : userText.trim().split("\\s+").length;
-        if (nvidia && isComplexTask(userText)) {
-            try {
-                content = nvidiaStream(main.NVIDIA_MODEL, msgs.toString(), 4096, 0.3);
-            } catch (Throwable t) {
-                log("nemotron action planner failed, falling back to groq: " + shortStr(String.valueOf(t.getMessage())));
-                String raw = postFast(msgs.toString(), words >= 22 ? "medium" : "low",
-                        words >= 22 ? 1400 : 900, 0.3);
-                Object c = dig(jparse(raw), "choices", 0, "message", "content");
-                content = c == null ? null : c.toString();
-            }
+        if (isComplexTask(userText)) {
+            content = streamDeep(msgs.toString(), 4096, 0.3);
         } else {
-            String raw = postFast(msgs.toString(), words >= 22 ? "medium" : "low", words >= 22 ? 1400 : 900, 0.3);
-            Object c = dig(jparse(raw), "choices", 0, "message", "content");
-            content = c == null ? null : c.toString();
+            content = completeFast(msgs.toString(), words >= 22 ? 1400 : 900, 0.3);
         }
         if (content == null || content.trim().isEmpty()) throw new Exception("empty model reply");
         return content;
@@ -10625,24 +11106,9 @@ class Brain {
         String user = "Write " + kind + " for: " + spec + "\nReply with only the raw content.";
         String msgs = "{\"role\":\"system\",\"content\":" + js(sys) + "},{"
                 + "\"role\":\"user\",\"content\":" + js(user) + "}";
-        String out;
-        if (nvidia) {
-            try {
-                if ("code".equals(kind)) {
-                    out = cleanComplex(nvidiaStream(main.NVIDIA_MODEL, msgs, 4096, 0.3));
-                } else {
-                    String body = nvidiaComplete(main.NVIDIA_MODEL, msgs, 3000, 0.5);
-                    Object content = dig(jparse(body), "choices", 0, "message", "content");
-                    if (content == null) throw new Exception("empty reply");
-                    out = content.toString().trim();
-                }
-            } catch (Throwable t) {
-                log("nemotron gen failed, falling back to groq: " + shortStr(String.valueOf(t.getMessage())));
-                out = groqGen(msgs);
-            }
-        } else {
-            out = groqGen(msgs);
-        }
+        String out = "code".equals(kind)
+                ? cleanComplex(streamDeep(msgs, 4096, 0.3))
+                : completeFast(msgs, 3000, 0.5).trim();
         if (out.startsWith("```")) {
             int nl = out.indexOf('\n');
             if (nl > 0) out = out.substring(nl + 1);
@@ -10651,14 +11117,6 @@ class Brain {
             out = out.trim();
         }
         return out;
-    }
-
-    String groqGen(String msgs) throws Exception {
-        String body = postJson("/chat/completions",
-                "{\"model\":" + js(CHAT_MODEL) + ",\"messages\":[" + msgs + "]}");
-        Object content = dig(jparse(body), "choices", 0, "message", "content");
-        if (content == null) throw new Exception("empty reply");
-        return content.toString().trim();
     }
 
     /* ============================================================
@@ -10704,23 +11162,23 @@ class Brain {
         "under 70 words, no markdown, no bullet points, no URLs, no citation markers. " +
         "Name the source briefly, for example 'according to BBC'. If sources disagree or you are unsure, say so. ";
 
-    final Set<String> compoundDead = new HashSet<>();
-
-    /** Gemini-style answer: Groq's built-in web-search models first, then DuckDuckGo + page reading. */
+    /** Gemini Google Search grounding first when Google key is available, then DuckDuckGo + page reading. */
     String webAnswer(String question) {
         String q = cleanWebQuery(question == null ? "" : question);
         String today = new java.text.SimpleDateFormat("EEEE, d MMMM yyyy", Locale.ENGLISH).format(new Date());
         log("web search: " + q);
-        for (String m : new String[]{"groq/compound-mini", "groq/compound"}) {
-            if (compoundDead.contains(m)) continue;
+        if (hasGoogle()) {
             try {
-                String a = cleanSpoken(webModelAnswer(m, q, today));
+                String sys = WEB_SYS + "Today is " + today + ".";
+                String msgs = "{\"role\":\"system\",\"content\":" + js(sys)
+                            + "},{\"role\":\"user\",\"content\":" + js(q) + "}";
+                String body = toGeminiBody(msgs, 512, 0.3, false, "[{\"google_search\":{}}]");
+                String res = googlePostRaw(GEMINI_FAST, "generateContent", body, 60000);
+                String a = cleanSpoken(extractGeminiText(res));
                 if (!a.isEmpty()) return a;
             } catch (Throwable t) {
-                String msg = String.valueOf(t.getMessage());
-                log("web model " + m + " failed: " + shortStr(msg));
-                if (msg.contains("404") || msg.contains("model_not_found") || msg.contains("does not exist")
-                        || msg.contains("403") || msg.contains("permission")) compoundDead.add(m);
+                log("google web search failed, falling back to duckduckgo: "
+                        + shortStr(String.valueOf(t.getMessage())));
             }
         }
         try {
@@ -10728,15 +11186,6 @@ class Brain {
             if (!a.isEmpty()) return a;
         } catch (Throwable t) { log("web scrape failed: " + shortStr(String.valueOf(t.getMessage()))); }
         return "Sorry, I couldn't reach the web right now.";
-    }
-
-    String webModelAnswer(String model, String q, String today) throws Exception {
-        String sys = WEB_SYS + "Today is " + today + ".";
-        String json = "{\"model\":" + js(model) + ",\"messages\":[{\"role\":\"system\",\"content\":" + js(sys)
-                + "},{\"role\":\"user\",\"content\":" + js(q) + "}]}";
-        Object content = dig(jparse(postJson("/chat/completions", json)), "choices", 0, "message", "content");
-        if (content == null) throw new Exception("empty web reply");
-        return content.toString();
     }
 
     String scrapedAnswer(String q, String today) throws Exception {
@@ -10757,11 +11206,11 @@ class Brain {
         String ctxS = ctx.length() > 12000 ? ctx.substring(0, 12000) : ctx.toString();
         String sys = WEB_SYS + "Today is " + today + ". Use ONLY the search results below.";
         String user = "Question: " + q + "\n\nSEARCH RESULTS:\n" + ctxS;
-        String json = "{\"model\":" + js(CHAT_MODEL) + ",\"messages\":[{\"role\":\"system\",\"content\":" + js(sys)
-                + "},{\"role\":\"user\",\"content\":" + js(user) + "}]}";
-        Object content = dig(jparse(postJson("/chat/completions", json)), "choices", 0, "message", "content");
-        if (content == null) throw new Exception("empty answer");
-        return content.toString();
+        String msgs = "{\"role\":\"system\",\"content\":" + js(sys)
+                    + "},{\"role\":\"user\",\"content\":" + js(user) + "}";
+        String content = completeFast(msgs, 512, 0.3);
+        if (content == null || content.trim().isEmpty()) throw new Exception("empty answer");
+        return content;
     }
 
     static final String WEB_UA =
@@ -11764,8 +12213,8 @@ class Brain {
         return VISION_RX.matcher(n).find();
     }
 
-    /** Screenshot of the whole desktop as a JPEG data URI (scaled to maxW wide). */
-    String screenDataUri(int maxW) throws Exception {
+    /** Screenshot of the whole desktop as an RGB BufferedImage (scaled to maxW wide). */
+    BufferedImage screenImage(int maxW) throws Exception {
         Rectangle vb = virtualBounds();
         BufferedImage full = new Robot().createScreenCapture(vb);
         BufferedImage rgb = new BufferedImage(
@@ -11777,58 +12226,58 @@ class Brain {
         g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
         g.drawImage(full, 0, 0, rgb.getWidth(), rgb.getHeight(), null);
         g.dispose();
-        ByteArrayOutputStream jb = new ByteArrayOutputStream();
-        ImageIO.write(rgb, "jpg", jb);
-        return "data:image/jpeg;base64," + Base64.getEncoder().encodeToString(jb.toByteArray());
+        return rgb;
     }
 
-    /** Step 1: the vision model (Nemotron VL first, then Qwen) describes the current screen for this question. */
+    /** Multimodal vision call across Google AI Studio (inline_data) and OpenRouter (image_url). */
+    String visionCall(Target vm, BufferedImage img, String prompt, int maxTokens, double temp) throws Exception {
+        BufferedImage rgb = toRgb(img);
+        ByteArrayOutputStream jb = new ByteArrayOutputStream();
+        ImageIO.write(rgb, "jpg", jb);
+        String b64 = Base64.getEncoder().encodeToString(jb.toByteArray());
+        if (vm.google) {
+            String json = "{\"contents\":[{\"parts\":["
+                        + "{\"text\":" + js(prompt) + "},"
+                        + "{\"inline_data\":{\"mime_type\":\"image/jpeg\",\"data\":" + js(b64) + "}}]}],"
+                        + "\"generationConfig\":{\"temperature\":" + temp + ",\"maxOutputTokens\":" + maxTokens + "}}";
+            String body = googlePostRaw(vm.model, "generateContent", json, 120000);
+            String d = extractGeminiText(body).trim();
+            if (d.isEmpty()) throw new Exception("google vision returned empty");
+            return d;
+        } else {
+            String uri = "data:image/jpeg;base64," + b64;
+            String json = "{\"model\":" + js(vm.model) + ",\"messages\":[{\"role\":\"user\",\"content\":["
+                        + "{\"type\":\"text\",\"text\":" + js(prompt) + "},"
+                        + "{\"type\":\"image_url\",\"image_url\":{\"url\":" + js(uri) + "}}]}],"
+                        + "\"temperature\":" + temp + ",\"max_tokens\":" + maxTokens + "}";
+            String body = orPostJson("/chat/completions", json, 120000);
+            Object content = dig(jparse(body), "choices", 0, "message", "content");
+            String d = content == null ? "" : cleanComplex(content.toString());
+            if (d.isEmpty()) throw new Exception("openrouter vision returned empty");
+            return d;
+        }
+    }
+
+    /** Step 1: the vision model describes the current screen for this question. */
     String describeScreen(String userText) throws Exception {
-        String uri = screenDataUri(1600);
+        BufferedImage img = screenImage(1600);
         String prompt =
             "You are the eyes of a voice assistant. This is a screenshot of the user's computer screen right now.\n" +
             "The user asked: \"" + userText + "\"\n" +
             "Describe what you see clearly and accurately: the main app or window, the key content, and any " +
             "readable text that matters for the question. Be factual and do not guess. Max 250 words.";
-        if (nvidia && !nvidiaVisionDead) {
+        List<Target> cands = visionCandidates();
+        if (cands.isEmpty()) throw new Exception("no vision model available on this key");
+        StringBuilder errs = new StringBuilder();
+        for (Target vm : cands) {
             try {
-                String json = "{\"model\":" + js(main.NVIDIA_MODEL) + ",\"messages\":[{\"role\":\"user\",\"content\":["
-                    + "{\"type\":\"text\",\"text\":" + js(prompt) + "},"
-                    + "{\"type\":\"image_url\",\"image_url\":{\"url\":" + js(uri) + "}}]}],"
-                    + "\"temperature\":0.2,\"max_tokens\":2048}";
-                String body = nvidiaPost("/chat/completions", json);
-                Object content = dig(jparse(body), "choices", 0, "message", "content");
-                String d = content == null ? "" : cleanComplex(content.toString());
+                String d = visionCall(vm, img, prompt, 2048, 0.2);
                 if (!d.isEmpty()) {
-                    log("vision (nemotron): " + shortStr(d));
+                    log("vision (" + vm + "): " + shortStr(d));
                     return d;
                 }
             } catch (Throwable t) {
-                if (isModelMissing(t)) nvidiaVisionDead = true;
-                log("nemotron vision failed: " + shortStr(String.valueOf(t.getMessage())));
-            }
-        }
-        List<String> cands = liveCands();
-        if (cands.isEmpty()) throw new Exception("no vision model available on this key");
-        StringBuilder errs = new StringBuilder();
-        for (String vm : cands) {
-            try {
-                String json = "{\"model\":" + js(vm) + ",\"messages\":[{\"role\":\"user\",\"content\":["
-                    + "{\"type\":\"text\",\"text\":" + js(prompt) + "},"
-                    + "{\"type\":\"image_url\",\"image_url\":{\"url\":" + js(uri) + "}}]}],"
-                    + "\"temperature\":0.2,\"max_tokens\":2048}";
-                String body = postJson("/chat/completions", json);
-                Object content = dig(jparse(body), "choices", 0, "message", "content");
-                String d = content == null ? "" : content.toString()
-                        .replaceAll("(?s)<think>.*?</think>", "").trim();
-                if (d.isEmpty()) { errs.append(vm).append(":empty;"); continue; }
-                if (visionPicked == null) { visionPicked = vm; }
-                log("vision (" + vm + "): " + shortStr(d));
-                return d;
-            } catch (Throwable t) {
                 String msg = String.valueOf(t.getMessage());
-                if (msg.contains("404") || msg.contains("does not exist") || msg.contains("model_not_found"))
-                    visionDead.add(vm);
                 errs.append(vm).append(':').append(shortStr(msg)).append(';');
                 log("vision " + vm + " failed: " + shortStr(msg));
             }
@@ -11838,8 +12287,9 @@ class Brain {
 
     /** Step 2: the reply model answers using only what the vision model described. */
     String replyFromVision(String userText, String desc) throws Exception {
-        String sys = nvidia
-            ? NEMOTRON_PERSONA + "\nWHAT YOU SAW:\n" + desc
+        boolean complex = isComplexTask(userText);
+        String sys = complex
+            ? REASONING_PERSONA + "\nWHAT YOU SAW:\n" + desc
             : "You are PROTON, a voice assistant. You just looked at the user's screen. What you saw is written below.\n" +
               "Answer the user's request using it, in first person (\"I can see...\"). Never mention a vision model, " +
               "a description or an image. Your reply is spoken aloud: plain natural English, max 70 words unless the " +
@@ -11852,19 +12302,11 @@ class Brain {
                 msgs.append(",{\"role\":\"").append(m.role)
                     .append("\",\"content\":").append(js(m.content)).append("}");
         }
-        if (nvidia) {
-            try {
-                String out = cleanComplex(nvidiaStream(main.NVIDIA_MODEL, msgs.toString(), 2600, 0.6));
-                if (out.isEmpty()) throw new Exception("empty reply");
-                return out;
-            } catch (Throwable t) {
-                log("nemotron vision reply failed, falling back to groq: " + shortStr(String.valueOf(t.getMessage())));
-            }
-        }
-        String json = "{\"model\":" + js(CHAT_MODEL) + ",\"messages\":[" + msgs + "]}";
-        Object content = dig(jparse(postJson("/chat/completions", json)), "choices", 0, "message", "content");
-        if (content == null || content.toString().trim().isEmpty()) throw new Exception("empty reply");
-        return content.toString().trim();
+        String out = complex
+                ? cleanComplex(streamDeep(msgs.toString(), 2600, 0.6))
+                : cleanSpoken(completeFast(msgs.toString(), 900, 0.6));
+        if (out.isEmpty()) throw new Exception("empty reply");
+        return out;
     }
 
     String visionAnswer(String userText) {
@@ -11888,48 +12330,6 @@ class Brain {
         }
     }
 
-    List<String> visionCands() {
-        if (visionCands != null) return visionCands;
-        synchronized (Brain.class) {
-            if (visionCands != null) return visionCands;
-            List<String> l = new ArrayList<>();
-            l.add(VISION_MODEL);
-            l.add("meta-llama/llama-4-scout-17b-16e-instruct");
-            l.add("llama-3.2-11b-vision-preview");
-            l.add("llama-3.2-90b-vision-preview");
-            try {
-                HttpURLConnection c = (HttpURLConnection)
-                        URI.create(BASE + "/models").toURL().openConnection();
-                c.setRequestProperty("Authorization", "Bearer " + key);
-                c.setConnectTimeout(8000); c.setReadTimeout(8000);
-                if (c.getResponseCode() == 200) {
-                    Object root = jparse(readStr(c.getInputStream()));
-                    Object data = dig(root, "data");
-                    if (data instanceof List) for (Object o : (List<?>) data) {
-                        if (!(o instanceof Map)) continue;
-                        Object idO = ((Map<?, ?>) o).get("id");
-                        if (idO == null) continue;
-                        String id = idO.toString();
-                        String low = id.toLowerCase(Locale.ROOT);
-                        if ((low.contains("vision") || low.contains("llama-4")
-                             || low.contains("scout") || low.contains("maverick"))
-                            && !l.contains(id)) l.add(id);
-                    }
-                }
-            } catch (Throwable ignored) {}
-            visionCands = l;
-            return l;
-        }
-    }
-
-    List<String> liveCands() {
-        List<String> src = visionCands();
-        List<String> out = new ArrayList<>();
-        if (visionPicked != null && !visionDead.contains(visionPicked)) out.add(visionPicked);
-        for (String m : src) if (!out.contains(m) && !visionDead.contains(m)) out.add(m);
-        return out;
-    }
-
     private static BufferedImage toRgb(BufferedImage src) {
         if (src.getType() == BufferedImage.TYPE_INT_RGB) return src;
         BufferedImage c = new BufferedImage(src.getWidth(), src.getHeight(), BufferedImage.TYPE_INT_RGB);
@@ -11940,11 +12340,8 @@ class Brain {
     static double num(Object o) { return Double.parseDouble(o.toString()); }
 
     /** Asks one vision model for the element's centre, in the pixel space of img. Null = not found. */
-    double[] askLocate(String vm, BufferedImage img, String desc, String hint) throws Exception {
+    double[] askLocate(Target vm, BufferedImage img, String desc, String hint) throws Exception {
         BufferedImage rgb = toRgb(img);
-        ByteArrayOutputStream jb = new ByteArrayOutputStream();
-        ImageIO.write(rgb, "jpg", jb);
-        String uri = "data:image/jpeg;base64," + Base64.getEncoder().encodeToString(jb.toByteArray());
         String prompt =
             "You are a pixel-accurate UI element locator.\n" +
             "Image size: " + rgb.getWidth() + " x " + rgb.getHeight() + " pixels (origin top-left, x to the right, y downward).\n" +
@@ -11954,14 +12351,8 @@ class Brain {
             "NOT the text caption underneath it. For a button, menu item or tab use the shape that holds its label.\n" +
             "Reply with ONLY JSON: {\"found\":true,\"box\":[x1,y1,x2,y2]} where the box tightly encloses that element " +
             "in image pixels, or {\"found\":false}.";
-        String json = "{\"model\":" + js(vm) + ",\"messages\":[{\"role\":\"user\",\"content\":["
-            + "{\"type\":\"text\",\"text\":" + js(prompt) + "},"
-            + "{\"type\":\"image_url\",\"image_url\":{\"url\":" + js(uri) + "}}]}],"
-            + "\"temperature\":0.1,\"max_tokens\":2048}";
-        String body = postJson("/chat/completions", json);
-        Object content = dig(jparse(body), "choices", 0, "message", "content");
-        if (content == null) throw new Exception("empty");
-        String j = extractJson(content.toString());
+        String content = visionCall(vm, rgb, prompt, 2048, 0.1);
+        String j = extractJson(content);
         if (j == null) throw new Exception("no json");
         Object o = jparse(j);
         if (!(o instanceof Map)) throw new Exception("bad json");
@@ -11980,7 +12371,7 @@ class Brain {
     }
 
     /** Pass 2: zoom into a 2x crop around the first guess and re-measure, so the click lands on the element's true centre. */
-    int[] refineLocate(String vm, BufferedImage full, int px, int py, String desc) throws Exception {
+    int[] refineLocate(Target vm, BufferedImage full, int px, int py, String desc) throws Exception {
         int cw = Math.min(560, full.getWidth()), ch = Math.min(360, full.getHeight());
         int x0 = Math.max(0, Math.min(full.getWidth()  - cw, px - cw / 2));
         int y0 = Math.max(0, Math.min(full.getHeight() - ch, py - ch / 2));
@@ -12044,7 +12435,7 @@ class Brain {
 
     int[] findOnScreen(String desc) throws Exception {
         if (desc == null || desc.trim().isEmpty()) throw new Exception("no description");
-        List<String> cands = liveCands();
+        List<Target> cands = visionCandidates();
         if (cands.isEmpty()) throw new Exception("vision: no models available on this key");
 
         boolean toastWas = MemoryToast.suspend();
@@ -12070,7 +12461,7 @@ class Brain {
                     boolean avoided = false;
                     if (ex != null) for (int[] av : avoidPts) if (Math.hypot(ex[0] - av[0], ex[1] - av[1]) < 30) avoided = true;
                     if (ex != null && !avoided && vb.contains(ex[0], ex[1])) {
-                        for (String vm : cands) {
+                        for (Target vm : cands) {
                             try {
                                 int[] ref = refineLocate(vm, full, ex[0] - vb.x, ex[1] - vb.y, desc);
                                 if (ref != null) {
@@ -12109,7 +12500,7 @@ class Brain {
         }
 
         StringBuilder errs = new StringBuilder();
-        for (String vm : cands) {
+        for (Target vm : cands) {
             try {
                 double[] c = askLocate(vm, send, desc, appHint);
                 if (c == null) { errs.append(vm).append(":not found;"); continue; }
@@ -12119,13 +12510,9 @@ class Brain {
                     int[] ref = refineLocate(vm, full, px, py, desc);
                     if (ref != null) { px = ref[0]; py = ref[1]; }
                 } catch (Throwable rt) { log("refine skipped: " + shortStr(String.valueOf(rt.getMessage()))); }
-                if (visionPicked == null) { visionPicked = vm; log("vision picked: " + vm); }
                 return new int[]{px + vb.x, py + vb.y};
             } catch (Throwable t) {
                 String msg = String.valueOf(t.getMessage());
-                if (msg.contains("404") || msg.contains("does not exist")
-                                    || msg.contains("model_not_found"))
-                    visionDead.add(vm);
                 errs.append(vm).append(':').append(shortStr(msg)).append(';');
             }
         }
@@ -12278,10 +12665,9 @@ class Brain {
         String user = "Description of the target: " + desc + "\nWindow: " + sc.title + "\n\nElements (number, type, name, "
             + "position as % from the window's top-left):\n" + b
             + "\nWhich element is the target? Reply ONLY JSON {\"i\": <number>} or {\"i\": -1} if none is clearly the one.";
-        Object content = dig(jparse(postFast("{\"role\":\"user\",\"content\":" + js(user) + "}", "low", 200, 0.0)),
-                             "choices", 0, "message", "content");
+        String content = completeFast("{\"role\":\"user\",\"content\":" + js(user) + "}", 200, 0.0);
         if (content == null) return null;
-        String j = extractJson(content.toString());
+        String j = extractJson(content);
         if (j == null) return null;
         Object o = jparse(j);
         if (!(o instanceof Map)) return null;
@@ -12337,23 +12723,13 @@ class Brain {
         return b.toString();
     }
 
-    String visionChat(String vm, BufferedImage img, String prompt, int maxTokens) throws Exception {
-        BufferedImage rgb = toRgb(ProtonMemory.fit(img, 1400));
-        ByteArrayOutputStream jb = new ByteArrayOutputStream();
-        ImageIO.write(rgb, "jpg", jb);
-        String uri = "data:image/jpeg;base64," + Base64.getEncoder().encodeToString(jb.toByteArray());
-        String json = "{\"model\":" + js(vm) + ",\"messages\":[{\"role\":\"user\",\"content\":["
-            + "{\"type\":\"text\",\"text\":" + js(prompt) + "},"
-            + "{\"type\":\"image_url\",\"image_url\":{\"url\":" + js(uri) + "}}]}],"
-            + "\"temperature\":0.2,\"max_tokens\":" + maxTokens + "}";
-        Object content = dig(jparse(postJson("/chat/completions", json)), "choices", 0, "message", "content");
-        if (content == null) throw new Exception("empty");
-        return content.toString();
+    String visionChat(Target vm, BufferedImage img, String prompt, int maxTokens) throws Exception {
+        return visionCall(vm, ProtonMemory.fit(img, 1400), prompt, maxTokens, 0.2);
     }
 
     @SuppressWarnings("unchecked")
     Map<String, Object> decideNext(String goal, List<String> hist, UiaScanner.Scan sc, BufferedImage full) throws Exception {
-        List<String> cands = liveCands();
+        List<Target> cands = visionCandidates();
         if (cands.isEmpty()) throw new Exception("no vision model available");
         StringBuilder p = new StringBuilder();
         p.append("You are the hands of a desktop assistant that operates apps with the mouse and keyboard.\n");
@@ -12381,19 +12757,16 @@ class Brain {
         p.append("- NEVER repeat an action that had NO visible change; pick a different element or approach.\n");
         p.append("- Do the goal fully (for example create all requested slides) before saying done.");
         Exception last = null;
-        for (String vm : cands) {
+        for (Target vm : cands) {
             try {
                 String raw = visionChat(vm, full, p.toString(), 700);
                 String j = extractJson(raw);
                 if (j == null) throw new Exception("no json");
                 Object o = jparse(j);
                 if (!(o instanceof Map)) throw new Exception("bad json");
-                if (visionPicked == null) visionPicked = vm;
                 return (Map<String, Object>) o;
             } catch (Exception ex) {
                 last = ex;
-                String msg = String.valueOf(ex.getMessage());
-                if (msg.contains("404") || msg.contains("does not exist") || msg.contains("model_not_found")) visionDead.add(vm);
             }
         }
         throw last != null ? last : new Exception("no decision");
@@ -12592,26 +12965,18 @@ class Brain {
 
     /** First visit: look at the whole window once and store a short description of its layout. */
     void describeLayoutAsync(final String key, final String display, final BufferedImage img) {
-        final List<String> cands = new ArrayList<>(liveCands());
+        final List<Target> cands = new ArrayList<>(visionCandidates());
         Thread t = new Thread(() -> {
             try {
-                BufferedImage rgb = toRgb(ProtonMemory.fit(img, 1200));
-                ByteArrayOutputStream jb = new ByteArrayOutputStream();
-                ImageIO.write(rgb, "jpg", jb);
-                String uri = "data:image/jpeg;base64," + Base64.getEncoder().encodeToString(jb.toByteArray());
+                BufferedImage fit = ProtonMemory.fit(img, 1200);
                 String prompt = "This is a screenshot of the application window \"" + display + "\". "
                     + "In under 70 words describe its layout for an assistant that drives it with the mouse: "
                     + "menu bar items, toolbar buttons and WHERE they are (left / right / top / bottom), and the main panels. "
                     + "Plain text only, no markdown.";
-                for (String vm : cands) {
+                for (Target vm : cands) {
                     try {
-                        String json = "{\"model\":" + js(vm) + ",\"messages\":[{\"role\":\"user\",\"content\":["
-                            + "{\"type\":\"text\",\"text\":" + js(prompt) + "},"
-                            + "{\"type\":\"image_url\",\"image_url\":{\"url\":" + js(uri) + "}}]}],"
-                            + "\"temperature\":0.2,\"max_tokens\":1024}";
-                        Object content = dig(jparse(postJson("/chat/completions", json)), "choices", 0, "message", "content");
-                        if (content == null) continue;
-                        String text = cleanSpoken(content.toString());
+                        String content = visionCall(vm, fit, prompt, 1024, 0.2);
+                        String text = cleanSpoken(content);
                         if (text.length() < 20) continue;
                         if (text.length() > 700) text = text.substring(0, 700);
                         ProtonMemory.setField(key, "layout", text);
@@ -12696,10 +13061,64 @@ class Brain {
         return "moved to \"" + desc + "\" at " + xy[0] + "," + xy[1];
     }
 
-    byte[] synthesize(String text, String model, String voice) throws Exception {
-        String json = "{\"model\":" + js(model) + ",\"voice\":" + js(voice)
-                    + ",\"input\":" + js(text) + ",\"response_format\":\"wav\"}";
-        return postJsonBytes("/audio/speech", json);
+    byte[] synthesizeOpenRouter(String text) throws Exception {
+        String json = "{\"model\":" + js(OR_TTS_MODEL) + ",\"input\":" + js(text)
+                    + ",\"response_format\":\"wav\"}";
+        byte[] audio = orPostBytes("/audio/speech", json, 60000);
+        if (audio == null || audio.length < 44 || audio[0] == '{' || audio[0] == '[') {
+            String preview = audio == null ? "null" : shortStr(new String(audio, StandardCharsets.UTF_8));
+            throw new Exception("openrouter tts invalid audio: " + preview);
+        }
+        return audio;
+    }
+
+    @SuppressWarnings("unchecked")
+    byte[] synthesizeGoogle(String text) throws Exception {
+        String withVoice = "{\"contents\":[{\"parts\":[{\"text\":" + js(text) + "}]}],"
+                         + "\"generationConfig\":{\"responseModalities\":[\"AUDIO\"],"
+                         + "\"speechConfig\":{\"voiceConfig\":{\"prebuiltVoiceConfig\":{\"voiceName\":\"Charon\"}}}}}";
+        String plain = "{\"contents\":[{\"parts\":[{\"text\":" + js(text) + "}]}],"
+                     + "\"generationConfig\":{\"responseModalities\":[\"AUDIO\"]}}";
+        String res;
+        try {
+            res = googlePostRaw(GEMINI_TTS, "generateContent", withVoice, 60000);
+        } catch (ApiException ex) {
+            if (ex.status == 400) {
+                res = googlePostRaw(GEMINI_TTS, "generateContent", plain, 60000);
+            } else {
+                throw ex;
+            }
+        }
+        Object parts = dig(jparse(res), "candidates", 0, "content", "parts");
+        if (!(parts instanceof List)) throw new Exception("google tts returned no audio parts");
+        for (Object po : (List<?>) parts) {
+            if (!(po instanceof Map)) continue;
+            Map<String, Object> pm = (Map<String, Object>) po;
+            Object inl = pm.get("inlineData");
+            if (inl == null) inl = pm.get("inline_data");
+            if (!(inl instanceof Map)) continue;
+            Map<String, Object> im = (Map<String, Object>) inl;
+            Object dataObj = im.get("data");
+            if (dataObj == null) continue;
+            String b64 = dataObj.toString().replaceAll("\\s+", "");
+            if (b64.isEmpty()) continue;
+            byte[] raw = Base64.getDecoder().decode(b64);
+            if (raw.length >= 12 && raw[0] == 'R' && raw[1] == 'I' && raw[2] == 'F' && raw[3] == 'F') {
+                return raw;
+            }
+            int rate = 24000;
+            Object mt = im.get("mimeType");
+            if (mt == null) mt = im.get("mime_type");
+            if (mt != null) {
+                java.util.regex.Matcher rm = java.util.regex.Pattern
+                        .compile("(?i)rate=(\\d+)").matcher(mt.toString());
+                if (rm.find()) {
+                    try { rate = Integer.parseInt(rm.group(1)); } catch (NumberFormatException ignored) {}
+                }
+            }
+            return toWav(raw, rate);
+        }
+        throw new Exception("google tts returned no inline audio");
     }
 
     private static int le16(byte[] b, int o) { return (b[o] & 0xFF) | ((b[o + 1] & 0xFF) << 8); }
@@ -13058,72 +13477,6 @@ class Brain {
                 return "opening " + phrase;
             } catch (Throwable t) { return "could not open \"" + phrase + "\""; }
         }
-    }
-
-    HttpURLConnection conn(String path) throws Exception {
-        HttpURLConnection c = (HttpURLConnection) URI.create(BASE + path).toURL().openConnection();
-        c.setRequestProperty("Authorization", "Bearer " + key);
-        c.setConnectTimeout(20000);
-        c.setReadTimeout(120000);
-        return c;
-    }
-
-    String postJson(String path, String json) throws Exception {
-        HttpURLConnection c = conn(path);
-        c.setRequestMethod("POST");
-        c.setDoOutput(true);
-        c.setRequestProperty("Content-Type", "application/json");
-        OutputStream o = c.getOutputStream();
-        try { o.write(json.getBytes(StandardCharsets.UTF_8)); } finally { o.close(); }
-        int code = c.getResponseCode();
-        InputStream in = (code >= 400) ? c.getErrorStream() : c.getInputStream();
-        String body = readStr(in);
-        if (code >= 400) throw new Exception("groq " + code + ": " + shortStr(body));
-        return body;
-    }
-
-    byte[] postJsonBytes(String path, String json) throws Exception {
-        HttpURLConnection c = conn(path);
-        c.setRequestMethod("POST");
-        c.setDoOutput(true);
-        c.setRequestProperty("Content-Type", "application/json");
-        OutputStream o = c.getOutputStream();
-        try { o.write(json.getBytes(StandardCharsets.UTF_8)); } finally { o.close(); }
-        int code = c.getResponseCode();
-        if (code >= 400) throw new Exception("groq " + code + ": "
-                + shortStr(readStr(c.getErrorStream())));
-        return readBytes(c.getInputStream());
-    }
-
-    String postMultipart(String path, byte[] file, String name,
-                         Map<String, String> fields) throws Exception {
-        String bd = "----ProtonBoundary" + System.currentTimeMillis();
-        HttpURLConnection c = conn(path);
-        c.setRequestMethod("POST");
-        c.setDoOutput(true);
-        c.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + bd);
-        OutputStream o = c.getOutputStream();
-        try {
-            o.write(("--" + bd + "\r\n").getBytes(StandardCharsets.UTF_8));
-            o.write(("Content-Disposition: form-data; name=\"file\"; filename=\""
-                     + name + "\"\r\n").getBytes(StandardCharsets.UTF_8));
-            o.write("Content-Type: audio/wav\r\n\r\n".getBytes(StandardCharsets.UTF_8));
-            o.write(file);
-            o.write("\r\n".getBytes(StandardCharsets.UTF_8));
-            for (Map.Entry<String, String> e : fields.entrySet()) {
-                o.write(("--" + bd + "\r\n").getBytes(StandardCharsets.UTF_8));
-                o.write(("Content-Disposition: form-data; name=\"" + e.getKey()
-                         + "\"\r\n\r\n").getBytes(StandardCharsets.UTF_8));
-                o.write(e.getValue().getBytes(StandardCharsets.UTF_8));
-                o.write("\r\n".getBytes(StandardCharsets.UTF_8));
-            }
-            o.write(("--" + bd + "--\r\n").getBytes(StandardCharsets.UTF_8));
-        } finally { o.close(); }
-        int code = c.getResponseCode();
-        InputStream in = (code >= 400) ? c.getErrorStream() : c.getInputStream();
-        String body = readStr(in);
-        if (code >= 400) throw new Exception("groq " + code + ": " + shortStr(body));
-        return body;
     }
 
     static String readStr(InputStream in) throws IOException {

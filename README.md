@@ -30,3 +30,4 @@ On first launch, choose your provider setup and paste your **Groq** (and optiona
 - **Safe Self-Modification:** `UpdateKit` pulls the latest commit from `Hellototech/Proton`, compiles `main.java` in an isolated temporary build directory first, and only swaps class files and restarts once compilation succeeds[cite: 1].
 
 ```
+**created by Aritra Dutta and Krishnendu Saha

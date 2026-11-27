@@ -1,32 +1,74 @@
-# PROTON AI
+<div align="center">
 
-**PROTON AI** is a zero-dependency, single-file Java desktop AI assistant (`main.java`) built for hands-free voice control, live coding, and autonomous PC automation. Powered by Groq and NVIDIA NIM (Nemotron), it pairs a custom 60 FPS audio-reactive 3D wireframe orb UI with OS-level automation, real-time noise cancellation, and self-extending skills—requiring no external libraries or backend server.
+# ⚡ P R O T O N &nbsp; A I
 
-## Key Features
+**A 60 FPS 3D-orb desktop AI assistant packed into a single, zero-dependency Java file.**  
+*Voice control · Live coding · Autonomous Windows automation · 100% Free BYOK*
 
-- **Hybrid Multi-Model Engine:** Combines **Groq** (`gpt-oss-120b`, Whisper Large v3 Turbo, Orpheus TTS, Qwen Vision) for fast conversation and voice I/O with **NVIDIA NIM** (`Nemotron`) for deep reasoning, coding, and a live translucent thought-stream overlay.
-- **Voice-First & Wake Activation:** Includes continuous hands-free Voice Mode, always-on `"Hey Proton"` wake-word detection (plus a global `Hold W` shortcut) with a floating Siri-style activation overlay, and a pure-Java real-time STFT noise suppressor.
-- **Desktop Automation & Spatial Memory:** Controls Windows applications via UI Automation and vision fallback, remembers UI element coordinates across sessions (`~/.proton`), and smoothly morphs into a 150×150px corner mini-orb HUD during multi-step tasks.
-- **Built-in PROTON IDE:** Writes complete code files in a read-only viewer with red/green line-by-line diffs on follow-up edits, then saves to `~/ProtonProjects` and syncs directly into active editors like VS Code, PyCharm, or IntelliJ.
-- **Self-Extending Skills & Auto-Updater:** Generates and runs custom PowerShell/Python/Bash scripts behind a red/black permission gate, and checks GitHub for updates with isolated pre-flight compilation and hot-restart.
+<p>
+  <a href="https://tryprotonai.pages.dev">
+    <img src="https://img.shields.io/badge/Website-tryprotonai.pages.dev-A855F7?style=for-the-badge&logo=cloudflarepages&logoColor=white" alt="Website" />
+  </a>
+  <a href="https://github.com/Hellototech/Proton-AI/releases/latest">
+    <img src="https://img.shields.io/badge/Download-Windows%20Installer-3D7BFF?style=for-the-badge&logo=windows11&logoColor=white" alt="Download Windows Installer" />
+  </a>
+  <img src="https://img.shields.io/badge/Java-17%2B%20|%200%20Deps-FF4DD0?style=for-the-badge&logo=openjdk&logoColor=white" alt="Java 17+ Zero Dependencies" />
+  <img src="https://img.shields.io/badge/1%20File-main.java-04030A?style=for-the-badge" alt="Single File" />
+</p>
 
-## Quick Start
+<!-- Drop your 30–45s demo GIF or GitHub video link right below -->
+<!-- ![PROTON AI Demo](demo.gif) -->
 
-```bash
-javac main.java && java main
-
-```
-
-On first launch, choose your provider setup and paste your **Groq** (and optional **NVIDIA NIM**) API keys—stored locally in `~/.proton-ai.properties`.
-
+</div>
 
 ---
 
-### What Stands Out in the Codebase
+## Why PROTON?
 
-- **Zero-Dependency Single-File Architecture:** Everything—custom `Graphics2D` shaders/gradients, 3D perspective sphere projection, audio capture, HTTP/SSE streaming, JSON parsing, and UI automation—is self-contained in `main.java` using only the standard JDK (`javax.swing`, `javax.sound.sampled`, `javax.tools.JavaCompiler`)[cite: 1].
-- **Pure-Java DSP Audio Pipeline:** `NoiseSuppressor` implements a 90 Hz biquad high-pass filter and an STFT Wiener filter with minimum-statistics noise tracking in-place on raw PCM frames before voice activity detection and Whisper transcription[cite: 1].
-- **Kinetic UI & Focus Management:** During desktop automation, `ProtonFrame` eases into a circular, non-focusable corner companion (`150×150px`) so `Robot` keystrokes and clicks never collide with PROTON's own window[cite: 1].
-- **Safe Self-Modification:** `UpdateKit` pulls the latest commit from `Hellototech/Proton`, compiles `main.java` in an isolated temporary build directory first, and only swaps class files and restarts once compilation succeeds[cite: 1].
+Most desktop AI assistants ship bloated Electron runtimes, subscriptions, and heavy dependencies. **PROTON AI** fits an entire voice-first OS copilot into **one standard-JDK `main.java` file**—zero Maven, zero Gradle, zero external JARs.
 
+- **🌌 60 FPS 3D Wireframe UI** — Pure Java2D orbital HUD with dedicated Assistant & hands-free Voice modes, `"Hey Proton"` wake word, and global `Hold W` floating overlay.
+- **🎙️ Real-Time Voice & Pure-Java DSP** — Built-in 90 Hz high-pass + STFT Wiener noise suppressor, streamed PCM audio playback, instant barge-in, 429 circuit breaker, and a warm local Windows TTS fallback.
+- **🤖 Autonomous Windows Control** — Operates desktop apps via Windows UI Automation + Vision fallback, caches learned layouts locally, and morphs into a `150×150px` corner orb during tasks.
+- **💻 PROTON IDE & Self-Extending Skills** — Generates complete code with live red/green diffs synced to VS Code, PyCharm, or IntelliJ, and runs custom PowerShell/Python/Bash skills behind an explicit approval gate.
+- **🔄 Install Once, Self-Updates Forever** — Pulls new commits from `main`, compiles in an isolated folder, and hot-restarts cleanly on its own.
+
+---
+
+## ⚡ Quick Start
+
+### Option 1: Windows Installer (Recommended — No Java Required)
+1. Download **`ProtonSetup.exe`** from **[tryprotonai.pages.dev](https://tryprotonai.pages.dev)** or **[GitHub Releases](https://github.com/Hellototech/Proton-AI/releases/latest)**.
+2. Run the setup wizard *(bundles a trimmed `jlink` runtime into `%LOCALAPPDATA%\PROTON AI`, no admin rights needed)*.
+3. Launch **PROTON AI** and connect **either** free API key (or both) on first start.
+
+### Option 2: Run From Source (JDK 17+)
+```bash
+git clone https://github.com/Hellototech/Proton-AI.git
+cd Proton-AI
+javac main.java && java main
 ```
+
+---
+
+## 🔑 100% Free BYOK Architecture
+
+Bring **one or both** free-tier keys—PROTON automatically routes every capability and falls back seamlessly on rate limits. Keys stay strictly local in `~/.proton-ai.properties`.
+
+| Provider | Free Models Used | Capabilities | Get Free Key |
+| :--- | :--- | :--- | :--- |
+| **Google AI Studio** | `gemini-3.8-flash`, `gemini-3.5-flash-lite`, `gemini-3.5-transcribe`, `gemini-3.8-flash-lite-tts` | Chat, Reasoning, Vision, Voice STT, TTS | [aistudio.google.com](https://aistudio.google.com) |
+| **OpenRouter** | `nvidia/nemotron-3.5-super-vl:free`, `fish-audio/s2.1-pro-free:free` | Deep Reasoning, Coding, Vision, Primary Neural TTS | [openrouter.ai/keys](https://openrouter.ai/keys) |
+| **Windows Local** | Built-in `System.Speech` (Warm Worker) | Zero-latency offline TTS fallback (unlimited) | *Built-in* |
+
+---
+
+<div align="center">
+
+**Built for speed. Zero bloat. 100% open source.**  
+
+**Built by Dev365**
+
+If PROTON AI blew your mind, drop a ⭐ on the repo!
+
+</div>

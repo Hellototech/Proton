@@ -1,5 +1,9 @@
 /*
- * PROTON AI -- single file, no backend.
+ * PROTON AI
+ * Copyright (c) 2026 Dev365. All rights reserved.
+ * Repository: https://github.com/Hellototech/Proton
+ *
+ * Single-file desktop AI workstation -- no backend, no external dependencies.
  * First launch asks for API keys; they are stored locally in ~/.proton-ai.properties.
  * javac main.java && java main
  */
@@ -40,6 +44,15 @@ import javax.tools.ToolProvider;
 public class main {
 
     /* ============================================================
+     *  VERSIONING & BRAND IDENTITY (Single Source of Truth)
+     * ============================================================ */
+    static final String APP_NAME            = "PROTON AI";
+    static final String APP_VERSION         = "v0.0.1"; // <-- Change version here
+    static final String APP_COMPANY         = "Dev365";
+    static final String APP_COPYRIGHT_SHORT = "\u00A9 2026 " + APP_COMPANY;
+    static final String APP_COPYRIGHT       = APP_COPYRIGHT_SHORT + ". All rights reserved.";
+
+    /* ============================================================
      *  PROVIDER / API KEY CONFIGURATION
      *  Keys are entered on first launch and stored locally in
      *  ~/.proton-ai.properties. Nothing is baked into the source.
@@ -51,6 +64,7 @@ public class main {
     static final int SPLASH_MS = 9000;
 
     public static void main(String[] args) {
+        System.out.println("[proton] " + APP_NAME + " " + APP_VERSION + " \u2014 " + APP_COPYRIGHT_SHORT);
         System.setProperty("swing.aatext", "true");
         System.setProperty("awt.useSystemAAFontSettings", "on");
 
@@ -627,6 +641,13 @@ class LoadingWindow extends JWindow {
                                     new Color(255, 255, 255, 0)}));
                 g2.fill(new RoundRectangle2D.Float(x, y, fw, barH, barH, barH));
             }
+
+            // Quiet centered micro-footer inside bottom margin
+            String foot = main.APP_VERSION + " \u00B7 " + main.APP_COMPANY;
+            g2.setFont(Fnt.get(Font.PLAIN, 11f));
+            g2.setColor(new Color(148, 163, 184, 148));
+            FontMetrics ffm = g2.getFontMetrics();
+            g2.drawString(foot, (w - ffm.stringWidth(foot)) / 2f, 422f);
         }
     }
 }
@@ -712,7 +733,7 @@ class SetupWindow extends JFrame {
     private final boolean changing;
 
     SetupWindow(boolean changing) {
-        super("PROTON AI");
+        super(main.APP_NAME);
         this.changing = changing;
         setUndecorated(true);
         setDefaultCloseOperation(changing ? DISPOSE_ON_CLOSE : EXIT_ON_CLOSE);
@@ -778,8 +799,8 @@ class SetupWindow extends JFrame {
         JPanel box = new JPanel();
         box.setOpaque(false);
         box.setLayout(new BoxLayout(box, BoxLayout.Y_AXIS));
-        box.setPreferredSize(new Dimension(520, 464));
-        box.setMaximumSize(new Dimension(520, 464));
+        box.setPreferredSize(new Dimension(520, 476));
+        box.setMaximumSize(new Dimension(520, 476));
 
         JPanel header = new JPanel(new BorderLayout(12, 0));
         header.setOpaque(false);
@@ -830,17 +851,25 @@ class SetupWindow extends JFrame {
         }
         actions.add(launchBtn, BorderLayout.EAST);
 
+        JLabel footer = label(main.APP_COPYRIGHT + " \u00B7 " + main.APP_VERSION,
+                Font.PLAIN, 10.5f, new Color(148, 163, 184, 150));
+        footer.setHorizontalAlignment(SwingConstants.CENTER);
+        footer.setAlignmentX(Component.LEFT_ALIGNMENT);
+        footer.setMaximumSize(new Dimension(520, 18));
+
         box.add(header);
         box.add(Box.createVerticalStrut(6));
         box.add(sub);
-        box.add(Box.createVerticalStrut(16));
+        box.add(Box.createVerticalStrut(14));
         box.add(googleCard);
-        box.add(Box.createVerticalStrut(12));
-        box.add(openrouterCard);
         box.add(Box.createVerticalStrut(10));
-        box.add(error);
+        box.add(openrouterCard);
         box.add(Box.createVerticalStrut(8));
+        box.add(error);
+        box.add(Box.createVerticalStrut(6));
         box.add(actions);
+        box.add(Box.createVerticalStrut(10));
+        box.add(footer);
         return box;
     }
 
@@ -1698,7 +1727,7 @@ class ProtonFrame extends JFrame {
     private SiriOverlay siri;
 
     ProtonFrame() {
-        super("PROTON AI");
+        super(main.APP_NAME);
         setUndecorated(true);
         setBackground(Theme.BG);
         try { setIconImages(BrandLogo.getWindowIcons()); } catch (Throwable ignored) {}
@@ -1708,7 +1737,7 @@ class ProtonFrame extends JFrame {
         normalBounds = getBounds();
         setDefaultCloseOperation(DO_NOTHING_ON_CLOSE);
 
-        glass = new GlassOverlay();
+        glass = new GlassOverlay(s);
         setGlassPane(glass);
         glass.setVisible(true);
 
@@ -2876,7 +2905,7 @@ final class UpdateKit {
         }
         latestSha = c.sha;
         if (manual || auto) installBlocking(manual);
-        else set(AVAILABLE, "Update available \u00B7 " + shortSha(c.sha));
+        else set(AVAILABLE, "Update available for " + main.APP_NAME);
     }
 
     private static void startInstallAsync(final boolean restartWhenDone) {
@@ -2927,16 +2956,15 @@ final class UpdateKit {
                 throw ce;
             }
             Prefs.setString("update.commit", sha);
-            String label = shortSha(sha);
 
             if (restartWhenDone) {
-                set(UPDATED, "Updated to " + label + " \u00B7 restarting\u2026");
-                MemoryToast.show("PROTON updated", label + " installed \u00B7 restarting", 0);
+                set(UPDATED, "Updated (" + main.APP_VERSION + ") \u00B7 restarting\u2026");
+                MemoryToast.show("PROTON updated", "Latest build installed \u00B7 restarting", 0);
                 try { Thread.sleep(1600); } catch (InterruptedException ignored) {}
                 SwingUtilities.invokeLater(main::restartApp);
             } else {
-                set(UPDATED, "Updated to " + label + " \u00B7 restart to finish.");
-                MemoryToast.show("PROTON updated", label + " installed \u00B7 restart to finish", 0);
+                set(UPDATED, "Updated (" + main.APP_VERSION + ") \u00B7 restart to finish.");
+                MemoryToast.show("PROTON updated", "Latest build installed \u00B7 restart to finish", 0);
             }
         } finally {
             deleteTree(tmp);
@@ -3948,7 +3976,7 @@ final class WarmWinTts {
 @SuppressWarnings("serial")
 class SettingsPanel extends JComponent {
     private static final int PANEL_W = 396;
-    private static final int CONTENT_H = 536;
+    private static final int CONTENT_H = 568;
 
     private final Runnable onClose;
     private final java.util.function.Consumer<Boolean> onWake;
@@ -4190,7 +4218,7 @@ class SettingsPanel extends JComponent {
         int tagX = 50 + sfm.stringWidth("Settings") + 8;
         g2.setFont(Fnt.get(Font.BOLD, 9.5f));
         g2.setColor(Theme.TEXT3);
-        g2.drawString("PROTON AI", tagX, 32);
+        g2.drawString(main.APP_NAME, tagX, 32);
 
         closeR.setBounds(w - 20 - 28, 14, 28, 28);
         if (hoverClose) {
@@ -4315,7 +4343,7 @@ class SettingsPanel extends JComponent {
                 py + (ph + fm2.getAscent() - fm2.getDescent()) / 2);
 
         // ---- Card 3: SYSTEM & UPDATES ----
-        int c3y = c2y + c2h + 12, c3h = 164;
+        int c3y = c2y + c2h + 12, c3h = 172;
         drawSubCard(g2, cardX, c3y, cardW, c3h);
         g2.setFont(Fnt.get(Font.BOLD, 9.5f));
         g2.setColor(new Color(0x7B819E));
@@ -4356,34 +4384,45 @@ class SettingsPanel extends JComponent {
         g2.drawString(updateLabel, ubx + (ubw - uf.stringWidth(updateLabel)) / 2,
                 uby + (ubh + uf.getAscent() - uf.getDescent()) / 2);
 
+        g2.setFont(Fnt.get(Font.PLAIN, 10.5f));
+        g2.setColor(Theme.TEXT2);
+        g2.drawString("Version: " + main.APP_VERSION, cardX + 16, c3y + 64);
+
         String stText = UpdateKit.state == UpdateKit.IDLE
                 ? ("Ready \u00B7 " + UpdateKit.BRANCH)
                 : UpdateKit.message;
-        Color stColor = UpdateKit.state == UpdateKit.IDLE ? Theme.TEXT2 : UpdateKit.statusColor();
-        g2.setFont(Fnt.get(Font.PLAIN, 10.5f));
+        Color stColor = UpdateKit.state == UpdateKit.IDLE ? Theme.TEXT3 : UpdateKit.statusColor();
+        g2.setFont(Fnt.get(Font.PLAIN, 10f));
         g2.setColor(stColor);
         String[] lines = wrap(g2, stText, cardW - 32 - ubw - 10, 2);
-        int ly = c3y + 64;
+        int ly = c3y + 80;
         for (String line : lines) {
             g2.drawString(line, cardX + 16, ly);
-            ly += 14;
+            ly += 13;
         }
 
         // Internal divider
         g2.setColor(new Color(255, 255, 255, 14));
-        g2.drawLine(cardX + 16, c3y + 98, cardX + cardW - 16, c3y + 98);
+        g2.drawLine(cardX + 16, c3y + 106, cardX + cardW - 16, c3y + 106);
 
-        autoRowR.setBounds(cardX + 8, c3y + 102, cardW - 16, 54);
+        autoRowR.setBounds(cardX + 8, c3y + 110, cardW - 16, 54);
         g2.setFont(Fnt.get(Font.BOLD, 12.5f));
         g2.setColor(Theme.TEXT);
-        g2.drawString("Auto update", cardX + 16, c3y + 123);
+        g2.drawString("Auto update", cardX + 16, c3y + 131);
         g2.setFont(Fnt.get(Font.PLAIN, 10.5f));
         g2.setColor(Theme.TEXT2);
-        g2.drawString("Checks GitHub every 10 minutes", cardX + 16, c3y + 142);
+        g2.drawString("Checks GitHub every 10 minutes", cardX + 16, c3y + 150);
 
-        int atx = cardX + cardW - 16 - 44, aty = c3y + 116;
+        int atx = cardX + cardW - 16 - 44, aty = c3y + 124;
         autoR.setBounds(atx, aty, 44, 24);
         drawPillToggle(g2, atx, aty, autoAnim, hoverAuto);
+
+        // ---- Centered Bottom Brand Footer ----
+        String footer = main.APP_NAME + " " + main.APP_VERSION + " \u00B7 " + main.APP_COPYRIGHT_SHORT;
+        g2.setFont(Fnt.get(Font.PLAIN, 11f));
+        g2.setColor(new Color(148, 163, 184, 150));
+        FontMetrics bfm = g2.getFontMetrics();
+        g2.drawString(footer, (w - bfm.stringWidth(footer)) / 2, c3y + c3h + 24);
 
         g2.setClip(prevClip);
         g2.dispose();
@@ -4745,9 +4784,10 @@ final class Icons {
 
 @SuppressWarnings("serial")
 class GlassOverlay extends JPanel {
+    private final S s;
     private String tip;
     private int tipX, tipY;
-    GlassOverlay() { setOpaque(false); setLayout(null); }
+    GlassOverlay(S s) { this.s = s; setOpaque(false); setLayout(null); }
     public boolean contains(int x, int y) { return false; }
     void showTip(String text, int x, int y) {
         if (tip != null && tip.equals(text) && x == tipX && y == tipY) return;
@@ -4756,26 +4796,44 @@ class GlassOverlay extends JPanel {
     }
     void hideTip() { if (tip != null) { tip = null; repaint(); } }
     protected void paintComponent(Graphics g) {
-        if (tip == null) return;
+        boolean showVersion = (s == null) || (!s.companionMode && s.morphProgress < 0.08f);
+        if (tip == null && !showVersion) return;
         Graphics2D g2 = (Graphics2D) g.create();
         g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
         g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
-        Font f = Fnt.get(Font.BOLD, 11.5f);
-        g2.setFont(f);
-        FontMetrics fm = g2.getFontMetrics();
-        int padX = 10, padY = 6;
-        int tw = fm.stringWidth(tip);
-        int th = fm.getHeight();
-        int w = tw + padX * 2, h = th + padY * 2;
-        int x = tipX, y = tipY - h / 2;
-        RoundRectangle2D rr = new RoundRectangle2D.Float(x, y, w, h, 9, 9);
-        g2.setColor(new Color(12, 10, 22, 246));
-        g2.fill(rr);
-        g2.setColor(new Color(255, 255, 255, 24));
-        g2.setStroke(new BasicStroke(1f));
-        g2.draw(rr);
-        g2.setColor(new Color(0xDF, 0xE1, 0xEE));
-        g2.drawString(tip, x + padX, y + padY + fm.getAscent());
+
+        if (showVersion && getWidth() > 260 && getHeight() > 200) {
+            float fade = (s == null) ? 1f : Math.max(0f, 1f - s.morphProgress / 0.08f);
+            int alpha = Math.round(115 * fade);
+            if (alpha > 2) {
+                g2.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 11));
+                FontMetrics vfm = g2.getFontMetrics();
+                String ver = main.APP_VERSION;
+                int vx = getWidth() - 14 - vfm.stringWidth(ver);
+                int vy = getHeight() - 10 - vfm.getDescent();
+                g2.setColor(new Color(180, 188, 212, alpha));
+                g2.drawString(ver, vx, vy);
+            }
+        }
+
+        if (tip != null) {
+            Font f = Fnt.get(Font.BOLD, 11.5f);
+            g2.setFont(f);
+            FontMetrics fm = g2.getFontMetrics();
+            int padX = 10, padY = 6;
+            int tw = fm.stringWidth(tip);
+            int th = fm.getHeight();
+            int w = tw + padX * 2, h = th + padY * 2;
+            int x = tipX, y = tipY - h / 2;
+            RoundRectangle2D rr = new RoundRectangle2D.Float(x, y, w, h, 9, 9);
+            g2.setColor(new Color(12, 10, 22, 246));
+            g2.fill(rr);
+            g2.setColor(new Color(255, 255, 255, 24));
+            g2.setStroke(new BasicStroke(1f));
+            g2.draw(rr);
+            g2.setColor(new Color(0xDF, 0xE1, 0xEE));
+            g2.drawString(tip, x + padX, y + padY + fm.getAscent());
+        }
         g2.dispose();
     }
 }
